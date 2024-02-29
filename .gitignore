@@ -1,0 +1,5 @@
+data
+model_checkpoints
+test_results
+cuda_dev
+mem.py
