@@ -4,7 +4,7 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer,pipel
 from torch.nn.utils.rnn import pad_sequence
 import concurrent.futures
 from copy import deepcopy
-from utils import HF_generate,extract_str_in_bracket
+from utils import HF_generate,extract_str_in_bracket,clean_answer,if_instruction_tuned,format_response,format_fs_qa
 from templates import self_reflection_prompt,self_answer_prompt
 from collections import defaultdict
 from functools import partial
@@ -16,73 +16,119 @@ import os
 import requests
 import warnings
 from newspaper import Article
+from tqdm import tqdm
+from huggingface_hub import InferenceClient
+import spacy
 
-def async_process(fn,inps,workers=10):
+def async_process(fn,inps,workers=10,msg=''):
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        out = list(executor.map(fn,inps))
+        out = list(tqdm(executor.map(fn,inps),total = len(inps),desc = msg))
     return out
 
+NLI_MODEL = {'semantic_consistency':"microsoft/deberta-large-mnli",
+             'BSDetector':"potsawee/deberta-v3-large-mnli",
+             "SelfCheckGPT":"potsawee/deberta-v3-large-mnli"}
+
 class NLIScorer:
-    def __init__(self, gen_model,model_path,tokenizer,scoring_method,beta=0.7,max_response_tokens= 128,answer_generator='self',use_tgi=True,prompt_fn_dict=None):
+    def __init__(self, gen_model,gen_model_name,tokenizer,scoring_method,beta=0.7,max_response_tokens= 128,answer_generator='self',use_tgi=True,answer_generator_port=8083,ref_as_chosen=False):
         """
         gen_model is the generation model
         beta is only used for BSDetector, weightage for self-reflection and Consistency score
         """
-        print ('model_path')
-        self.nli_model = AutoModelForSequenceClassification.from_pretrained(model_path).cuda()
-        self.nli_tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.nli_model = AutoModelForSequenceClassification.from_pretrained(NLI_MODEL[scoring_method]).cuda()
+        self.nli_tokenizer = AutoTokenizer.from_pretrained(NLI_MODEL[scoring_method])
         self.gen_tokenizer = tokenizer
+        self.gen_tokenizer.padding_side = 'left' #pad left side for generative.
+        self.gen_model_name = gen_model_name
         self.scoring_method = scoring_method
         self.nli_model.eval()   
         self.gen_model = gen_model 
         self.beta = beta
         self.answer_generator = answer_generator
         if self.answer_generator == 'oracle':
-            self.ans_generator = QAScorer()
+            self.ans_generator = QAScorer(with_summarize=False)
+        elif self.answer_generator == 'mistral_8x7': # uses another TGI
+            self.ans_generator = InferenceClient(model = f"http://127.0.0.1:{answer_generator_port}")
+            self.ans_tokenizer = AutoTokenizer.from_pretrained("mistralai/Mixtral-8x7B-Instruct-v0.1")
         self.use_tgi = use_tgi
         if not self.use_tgi:
             self.gen_model.eval()
-        self.extract_ans_fn = prompt_fn_dict['extract_ans_fn']
-        self.prompt_fn = prompt_fn_dict['prompt_fn']['answer_gen']
         self.max_response_tokens = max_response_tokens
+        self.max_nli_size = 100
+        self.ref_as_chosen = ref_as_chosen # if reference answer is golden.
+        self.nli_sentence_level = True 
+        self.sentence_processor =  spacy.load("en_core_web_sm")
         
     def generate(self,prompt,mode = 'self_reflect'):
         do_sample=False
         if mode == 'self_reflect':
             max_new_tokens = 3
-            repetition_penalty = 1.0
+            repetition_penalty = 1.1
         else:
             max_new_tokens = self.max_response_tokens
             repetition_penalty = 1.1
-        if self.use_tgi:
-            return self.gen_model.text_generation(prompt, max_new_tokens=max_new_tokens, do_sample = do_sample, repetition_penalty = repetition_penalty)
-        else:
-            hf_gen_kwargs = {'do_sample':do_sample,'max_new_tokens':max_new_tokens,'repetition_penalty':repetition_penalty}
-            out =  HF_generate(prompt,self.gen_model,self.gen_tokenizer,hf_gen_kwargs,self.extract_ans_fn)
-            return [o['text'] for o in out]
-            
+        hf_gen_kwargs = {'do_sample':do_sample,'max_new_tokens':max_new_tokens,'repetition_penalty':repetition_penalty}
+        out = HF_generate(prompt,self.gen_model,self.gen_tokenizer,hf_gen_kwargs,self.use_tgi,max_workers = len(prompt),return_as_dict=False)
+        return out
     
-    def get_nli_score(self,ref_answer,sample_answers):
-        all_concatenated_ans = [ref_answer + ' [SEP] ' + sample_a for sample_a in sample_answers] 
-        tokenized_inputs = self.nli_tokenizer(all_concatenated_ans, padding=True, return_tensors="pt",max_length = 512, truncation=True)
-        tokenized_inputs = {k: v.cuda() for k, v in tokenized_inputs.items()}
-        with torch.no_grad():
-            nli_preds = self.nli_model(**tokenized_inputs).logits
-        nli_probs = torch.nn.functional.softmax(nli_preds, dim=1)
-        entailment_probs = nli_probs[:,2]
-        mean_entailment_probs = torch.mean(entailment_probs).item()
+    def get_nli_score(self,batch,return_full_score = False):
+        """
+        Assume batch contains a list of tuples where the 1st item is the reference sentence, while the 2nd item is a list of sampled sentences.
+        """
+        if self.nli_sentence_level:
+            sentence_count = []
+            full_batch = []
+            for b in batch:
+                sampled_ = b[1]
+                sents = [s.text.strip() for s in self.sentence_processor(b[0]).sents]
+                full_batch.extend([(s,sampled_) for s in sents])
+                sentence_count.append(len(sents))
+            assert sum(sentence_count) == len(full_batch), 'Sentence count does not match'
+            all_preds = []
+            for batch_id in range(0,len(full_batch),self.max_nli_size):
+                batch = full_batch[batch_id:batch_id+self.max_nli_size]
+                tokenized_inputs = self.nli_tokenizer.batch_encode_plus(batch_text_or_text_pairs = batch, padding='longest', return_tensors="pt",max_length = 512, truncation=True,add_special_tokens=True,return_token_type_ids=True, return_attention_mask=True)
+                tokenized_inputs = {k: v.cuda() for k, v in tokenized_inputs.items()}
+                with torch.no_grad():
+                    nli_preds = self.nli_model(**tokenized_inputs).logits.detach().cpu()
+                all_preds.append(nli_preds)
+            all_preds = torch.cat(all_preds,dim=0)
+            all_probs = torch.nn.functional.softmax(all_preds, dim=1)
+            
+            nli_probs = []
+            ## split the full batch back to [list of individual samples where each list contains the sentence level preds]
+            for num_sen in sentence_count:
+                nli_probs.append(all_probs[:num_sen].mean(dim=0))
+                all_probs = all_probs[num_sen:]
+            nli_probs = torch.stack(nli_probs)
+        else:
+            tokenized_inputs = self.nli_tokenizer.batch_encode_plus(batch_text_or_text_pairs = batch, padding='longest', return_tensors="pt",max_length = 512, truncation=True,add_special_tokens=True,return_token_type_ids=True, return_attention_mask=True)
+            tokenized_inputs = {k: v.cuda() for k, v in tokenized_inputs.items()}
+            with torch.no_grad():
+                nli_preds = self.nli_model(**tokenized_inputs).logits.detach().cpu()
+            nli_probs = torch.nn.functional.softmax(nli_preds, dim=1)
+            
+        if not return_full_score:
+            if self.scoring_method == 'BSDetector':
+                return nli_probs[:,0] # entailment prob
+            elif self.scoring_method == 'SelfCheckGPT':
+                return nli_probs[:,1] # contradiction prob
+        else:
+            return nli_probs
         
-        return mean_entailment_probs
-
     def get_score(self,instruction,ref_answer,sample_answer): ## use to score questions
         if self.use_tgi:
             sample_text = [sample_answer.generated_text] + [s.generated_text for s in sample_answer.details.best_of_sequences]
-            if ref_answer is not None:
-                ref_answer = ref_answer.generated_text
+            ref_text = ref_answer.generated_text
         else:
             sample_text = [s['text'] for s in sample_answer]
-            if ref_answer is not None:
-                ref_answer = ref_answer['text'] 
+            ref_text = ref_answer['text']
+        all_answers = [ref_text]+ sample_text
+        # Clean the answers if not instruct tuned.
+        if not if_instruction_tuned(self.gen_model_name):
+            sample_text = [clean_answer(x) for x in sample_text]
+            ref_text = clean_answer(ref_text)
+        
         if self.scoring_method == 'BSDetector':
             """
             From the paper: QUANTIFYING UNCERTAINTY IN ANSWERS FROM ANY LANGUAGE MODEL AND ENHANCING THEIR TRUSTWORTHINESS
@@ -92,40 +138,44 @@ class NLIScorer:
             ** Note that this is similar to SelfCheck NLI approach, but includes a self-reflection score where the model's self confidence is accounted for as well. If beta = 1, then it is the same as SelfCheck NLI (except the fact we look at entail probs instead of thresholding to [0,0.5,1])
             """
             ## Get Consistency score O ##
-            all_answers = [ref_answer]+ sample_text
-            o = self.get_nli_score(ref_answer,sample_text)
+            nli_batch = [(ref_text,a) for a in sample_text]
+            if self.ref_as_chosen:
+                nli_scores =  self.get_nli_score(nli_batch,return_full_score=True) # we want the contradict scores as well.
+                o = nli_scores[:,0].mean().item()
+            else:
+                o = self.get_nli_score(nli_batch).mean().item()
+                nli_scores = None
             ## Get self-reflection certainty score S ##
             if self.beta < 1: # if beta is 1, then we dont need to calculate self-reflection score
-                self_reflect_prompt = [self.prompt_fn(self_reflection_prompt.format(instruction = instruction, answer = a)) for a in  all_answers]
-                if self.use_tgi:
-                    reflect_fn = partial(self.generate,mode = 'self_reflect')
-                    reflect_ans = async_process(reflect_fn,self_reflect_prompt,workers = len(self_reflect_prompt))
+                if if_instruction_tuned(self.gen_model_name):
+                    self_reflect_prompt = [format_response([{'role':'user',
+                                                            'content':self_reflection_prompt.format(instruction = instruction, answer = a)}]
+                                                        ,self.gen_model_name,self.gen_tokenizer,mode='answer') 
+                                                        for a in  all_answers]
                 else:
-                    reflect_ans = self.generate(self_reflect_prompt,mode = 'self_reflect')
+                    self_reflect_prompt = [self_reflection_prompt.format(instruction = instruction, answer = a) for a in all_answers]
+                    
+                reflect_ans = self.generate(self_reflect_prompt,mode = 'self_reflect')
                 if isinstance(reflect_ans[0],list): # unroll the list
                     reflect_ans = sum(reflect_ans,[])
                 reflect_scores = []
-                reflect_logs = defaultdict(int)
+
                 for ra in reflect_ans:
-                    ra = extract_str_in_bracket(ra)
+                    ra = extract_str_in_bracket(ra).strip()
                     if 'a' in ra.lower():
-                        reflect_logs['a']+=1
                         reflect_scores.append(1)
                     elif 'b' in ra.lower():
-                        reflect_logs['b']+=1
                         reflect_scores.append(0)
                     else:
-                        reflect_logs['c']+=1
                         reflect_scores.append(0.5)
                 s = np.mean(reflect_scores)
             else:
                 s = 0.
                 reflect_scores = [0. for _ in range(len(all_answers))]
-                reflect_logs=None
             
             overall_confidence =  (self.beta * o) + ((1 - self.beta) * s) # confidence for response to question x
             
-            return {'confidence':overall_confidence,'instruction':instruction,'ref_answer':ref_answer,'sample_answer':sample_text,'self_reflect_score':reflect_scores,'consistency_score':o,'reflect_logs':reflect_logs}
+            return {'confidence':overall_confidence,'instruction':instruction,'ref_answer':ref_text,'sample_answer':sample_text,'self_reflect_score':reflect_scores,'consistency_score':o,'all_nli_scores':nli_scores}
         
         elif self.scoring_method == 'semantic_consistency':
             """
@@ -137,27 +187,35 @@ class NLIScorer:
             Clusters with lowest entropy can be used as chosen answer where a random answer within the cluster is chosen, and clusters with highest entropy can be used as rejected answer
             Overall entropy is used as uncertainty score.
             """
+            main_answer = [ref_answer,sample_answer] # because main_answer tokens stored differently then the rest
             if self.use_tgi:
                 ## Setup text to logprob dict ##
                 text_2_logprob = defaultdict()
-                main_answer = sample_text[0]
-                rest_answer = sample_text[1:]
-                text_2_logprob[main_answer] = (np.sum([t.logprob for t in sample_answer.details.tokens])/len(sample_answer.details.tokens)).item()
-                for rest_text,rest_logp in zip(rest_answer,sample_answer.details.best_of_sequences):
-                    text_2_logprob[rest_text] = (np.sum([t.logprob for t in rest_logp.tokens])/len(rest_logp.tokens)).item()
+                for main in main_answer:
+                    text_2_logprob[main.generated_text] = (np.sum([t.logprob for t in main.details.tokens])/len(main.details.tokens))
+                for rest in sample_answer.details.best_of_sequences:
+                    text_2_logprob[rest.generated_text] = (np.sum([t.logprob for t in rest.tokens])/len(rest.tokens))
             else:
                 if any([np.any(s['logprobs']==np.inf) for s in sample_answer]):
                     print ('inf logprob present')
                     return None
-                text_2_logprob = {s['text']:s['logprobs'].mean().item() for s in sample_answer}
-            semantic_clusters = self.cluster_semantic_sets(instruction,sample_text)
+                text_2_logprob = {s['text']:s['logprobs'].mean() for s in main_answer}
+            semantic_clusters = self.cluster_semantic_sets(instruction,all_answers)
             all_cluster_entropies,overall_entropy = self.get_cluster_entropy(semantic_clusters,text_2_logprob)
 
-            return {'overall_entropy':overall_entropy,'instruction':instruction,'sample_answer':sample_text,'ref_answer':ref_answer,'all_cluster_entropies':all_cluster_entropies,
+            return {'entropy':overall_entropy,'instruction':instruction,'sample_answer':sample_text,'ref_answer':ref_text,'all_cluster_entropies':all_cluster_entropies,
                     'semantic_clusters':semantic_clusters}
+        
+        elif self.scoring_method == 'SelfCheckGPT':
+            nli_batch = [(ref_text,a) for a in sample_text]
+            all_hallu_scores =  self.get_nli_score(nli_batch)
+            hallu_score = all_hallu_scores.mean().item()
+            
+            return {'hallucination':hallu_score,'instruction':instruction,'ref_answer':ref_text,'sample_answer':sample_text,'all_hallu_scores':all_hallu_scores}
     
-    def get_dpo_sample(self,content_dict): # use confidence/uncertainty measures to score responses
+    def get_dpo_sample(self,content_dict,few_shots=None): # use confidence/uncertainty measures to score responses
         """
+        few_shots only available if fixed_ds is used, aka reference dataset is available, in here, only used for API, self is generated out of this fn.
         Output dict should consist of 
         1) prompt, chosen and rejected answer for DPO training
         2) question confidence/uncertainty score to assess the model's confidence/uncertainty in self-generated questions
@@ -166,68 +224,96 @@ class NLIScorer:
         """
         sample_answers = content_dict['sample_answer']
         instruction = content_dict['instruction']
-        pre_response = content_dict['ref_answer']
-        if not isinstance(pre_response,str):
-            pre_response = pre_response.generated_text
+        topic = content_dict['topic']
+        ref_answer = content_dict['ref_answer']
+        num_sample = len(sample_answers)
+
         # Between different scoring types, first pick worst answer, if self-generate best answer, pick it via the heuristics, else use oracle/gpt
-        if self.scoring_method == 'BSDetector':
-            ref_answer = content_dict['ref_answer']
-            qn_metric = {'qn_confidence':content_dict['confidence']}
+        if self.scoring_method == 'BSDetector': # Each sampled answer act as reference, pick best and worse instead of always picking the ref answer
+            remaining_reflect_scores = deepcopy(content_dict['self_reflect_score'])[1:] # remove the ref answer score
+            if not self.ref_as_chosen:
+                all_answers = [ref_answer]+ sample_answers
+                ref_ans_confidence = (self.beta * content_dict['consistency_score']) + ((1 - self.beta) * content_dict['self_reflect_score'][0])
+                all_ans_confidence  = [ref_ans_confidence]
+                for i,sampled_ans in enumerate(sample_answers): # each sampled_answer will act as the reference ans
+                    curr_ans_list = [sample_answers[j] for j in range(len(sample_answers)) if j != i] + [ref_answer]
+                    curr_nli_batch = [(sampled_ans,a) for a in curr_ans_list]
+                    curr_nli_score = self.get_nli_score(curr_nli_batch).mean().item()
+                    all_ans_confidence.append((self.beta * curr_nli_score) + ((1 - self.beta) * remaining_reflect_scores[i]))
+
+            else: # we compare contradict scores against ref answer to choose the worse answer. chosen is ref.
+                all_ans_confidence = []
+                all_answers = sample_answers
+                if 'all_nli_scores' not in  content_dict:
+                    content_dict['all_nli_scores'] = self.get_nli_score([ref_answer + ' [SEP] ' + a for a in sample_answers],return_full_score=True)
+                contrad_scores = content_dict['all_nli_scores'][:,1].tolist()
+                all_ans_confidence = [(self.beta * (1.0-contra)) + ((1 - self.beta) * curr_r) for contra,curr_r in zip(contrad_scores,remaining_reflect_scores)] # take 1-contra to convert to positive to check for min.
+                
+            max_confidence_id = np.argmax(all_ans_confidence)
+            min_confidence_id = np.argmin(all_ans_confidence) 
+            rejected_ans = all_answers[min_confidence_id]
+            chosen_ans = all_answers[max_confidence_id] 
+            question_score = 1.0 - content_dict['confidence'] # take the inverse of confidence
+
         elif self.scoring_method == 'semantic_consistency':
             semantic_clusters = content_dict['semantic_clusters'] # id to list of responses
             all_cluster_entropies = content_dict['all_cluster_entropies'] # id to entropy
+            if self.ref_as_chosen: # if reference picked as chosen, remove the cluster that contains ref ans (since that is the chosen) and sample from rest.
+                assert len(list(all_cluster_entropies.keys())) > 1, 'Only 1 cluster found, cannot sample'
+                for cluster_id,cluster in semantic_clusters.items():
+                    if ref_answer in cluster:
+                        del semantic_clusters[cluster_id]
+                        del all_cluster_entropies[cluster_id]
+                        break
             sorted_cluster_entropies = {k:v for k,v in sorted(all_cluster_entropies.items(),key=lambda x:x[1])}
-            ref_answer = random.choice(semantic_clusters[list(sorted_cluster_entropies.keys())[-1]]) # pick the answer with the highest entropy
-            qn_metric = {'qn_entropy':content_dict['overall_entropy']}
+            rejected_ans = random.choice(semantic_clusters[list(sorted_cluster_entropies.keys())[-1]]) # highest entropy as rejected.
+            chosen_ans = random.choice(semantic_clusters[list(sorted_cluster_entropies.keys())[0]]) # lowest entropy as chosen
+            question_score = content_dict['entropy']
+        
+        elif self.scoring_method == 'SelfCheckGPT': ## Very similar to BSDetector but without self-reflect.
+            if not self.ref_as_chosen:
+                all_answers = [ref_answer]+ sample_answers
+                all_hallu_scores = [content_dict['hallucination']]
+                for i,sampled_ans in enumerate(sample_answers): 
+                    curr_ans_list = [sample_answers[j] for j in range(len(sample_answers)) if j != i] + [ref_answer]
+                    curr_nli_batch = [(sampled_ans,a) for a in curr_ans_list]
+                    curr_nli_score = self.get_nli_score(curr_nli_batch).mean().item()
+                    all_hallu_scores.append(curr_nli_score)
+            else:
+                all_answers = sample_answers
+                all_hallu_scores = content_dict['all_hallu_scores']
+
+            max_hallu_id = np.argmax(all_hallu_scores)
+            min_hallu_id = np.argmin(all_hallu_scores)
+            chosen_ans = all_answers[min_hallu_id]
+            rejected_ans = all_answers[max_hallu_id]
+            question_score = content_dict['hallucination']
+            
         else:
             raise ValueError('Invalid scoring method')
+        
+        ## Few shot only used for external LLM such as GPT3.5/4 or Mistral_MOE
+        if few_shots is not None:
+            few_shots = few_shots[topic]
+            fs_messages = format_fs_qa(few_shots,True)
+        else:
+            fs_messages = []
+        
+        if self.ref_as_chosen and 'self' in self.answer_generator: # force chosen ans as reference answer
+            chosen_ans = ref_answer
             
-        if self.answer_generator == 'self': # pick either most confident or least entropy response as chosen answer #
-            if self.scoring_method == 'BSDetector':
-                all_answers = [ref_answer]+ sample_answers
-                ref_ans_confidence = (self.beta * content_dict['consistency_score']) + ((1 - self.beta) * content_dict['self_reflect_score'][0])
-                
-                remaining_reflect_scores = deepcopy(content_dict['self_reflect_score'])[1:] # remove the ref answer score
-                all_ans_confidence  = [ref_ans_confidence]
-                for i,sampled_ans in enumerate(sample_answers): # each sampled_answer will act as the reference ans
-                    curr_ans_list = [a for a in deepcopy(sample_answers) if a != sampled_ans] + [ref_answer]
-                    curr_o = self.get_nli_score(sampled_ans,curr_ans_list)
-                    all_ans_confidence.append((self.beta * curr_o) + ((1 - self.beta) * remaining_reflect_scores[i]))
-                
-                max_confidence_id = np.argmax(all_ans_confidence)
-                min_confidence_id = np.argmin(all_ans_confidence) 
-                
-                chosen_ans = all_answers[max_confidence_id]
-                rejected_ans = all_answers[min_confidence_id]
-                max_confidence = all_ans_confidence[max_confidence_id]
-                min_confidence = all_ans_confidence[min_confidence_id]
-                
-                return {**qn_metric,
-                    'chosen_ans':chosen_ans,
-                    'rejected_ans':rejected_ans,
-                    'max_confidence':max_confidence,
-                    'min_confidence':min_confidence,
-                    'instruction':instruction,
-                    'topic':content_dict['topic'],
-                    'pre_response':pre_response
-                    }
-                
-            elif self.scoring_method == 'semantic_consistency':
-                chosen_ans = random.choice(semantic_clusters[list(sorted_cluster_entropies.keys())[0]])
-                rejected_ans = ref_answer
-                return {**qn_metric,'chosen_ans':chosen_ans,
-                    'rejected_ans':rejected_ans,
-                    'chosen_entropy':list(sorted_cluster_entropies.values())[0],
-                    'rejected_entropy':list(sorted_cluster_entropies.values())[-1],
-                    'instruction':instruction,
-                    'topic':content_dict['topic'],
-                    'pre_response':pre_response
-                    }    
-            
-        elif self.answer_generator == 'oracle': # Use Google search to find documents and self-generate answer with document
+        out_dict = {
+                'instruction':instruction,
+                'topic':topic,
+                'chosen_ans':chosen_ans,
+                'rejected_ans':rejected_ans,
+                'question_score':question_score
+                }
+        ## Different answer generator ## if self just return out_dict else use another operator to get chosen answer.
+        
+        if self.answer_generator == 'oracle': # Use Google search to find documents and self-generate answer with document
             """
             Creating the chosen answer as "{extracted answer}. {summary}" seems to do poorly, as often, the extracted answer does not reliably answer the question.
-            
             """
             scored_documents = self.ans_generator.get_scored_document(instruction) # returns a list of dicts containing document and score
             if len(scored_documents) == 0: # no valid documents
@@ -243,6 +329,7 @@ class NLIScorer:
                 chosen_ans = self.generate(selected_prompt,mode = 'answering')
                 if isinstance(chosen_ans,list):
                     chosen_ans = chosen_ans[0]
+                out_dict['chosen_ans'] = chosen_ans
             else:
                 top_document = sorted(scored_documents,key=lambda x:x['score'],reverse=True)[0]
                 selected_docu = top_document['document']
@@ -255,27 +342,20 @@ class NLIScorer:
                     truncation=True,
                     clean_up_tokenization_spaces=True
                 )
-                chosen_ans = selected_ans + '. ' + summarized_docu[0]['summary_text']
-                
-            # rejected_ans = random.choice(sample_answers) # randomly sample from the sample answers
-            rejected_ans = ref_answer
+                out_dict['chosen_ans'] = selected_ans + '. ' + summarized_docu[0]['summary_text']
             
-            return {**qn_metric,'chosen_ans':chosen_ans,
-                    'rejected_ans':rejected_ans,
-                    'instruction':instruction,
-                    'topic':content_dict['topic'],
-                    'link': [x['link'] for x in scored_documents],
-                    'pre_response':pre_response
-                    }
-        
-        elif 'gpt' in self.answer_generator: # use OPENAI GPT3.5/4 to generate answers
+            out_dict['link'] = [x['link'] for x in scored_documents]
+
+        elif self.answer_generator in ['gpt4','gpt3.5']: # use OPENAI GPT3.5/4 to generate answers
             client = OpenAI()
             messages = [{'role':'user','content':instruction}]
+            print (instruction)
+            final_message = fs_messages + messages
             engine = 'gpt-4-0125-preview' if 'gpt4' in self.answer_generator else 'gpt-3.5-turbo-0125'
             try:
                 response = client.chat.completions.create(
                 model=engine,
-                messages=messages,
+                messages=final_message,
                 temperature=0,
                 max_tokens=self.max_response_tokens,
                 )
@@ -283,22 +363,29 @@ class NLIScorer:
                 time.sleep(2)
                 response = client.chat.completions.create(
                 model=engine,
-                messages=messages,
+                messages=final_message,
                 temperature=0,
                 max_tokens=128,
                 )
-            chosen_ans = response.choices[0].message.content
-            rejected_ans = ref_answer
+            out_dict['chosen_ans'] = response.choices[0].message.content
             inp_tokens = response.usage.prompt_tokens
             out_tokens = response.usage.completion_tokens
-            return {**qn_metric,'chosen_ans':chosen_ans,
-                    'rejected_ans':rejected_ans,
-                    'instruction':instruction,
-                    'topic':content_dict['topic'],
-                    'inp_tokens':inp_tokens,
-                    'out_tokens':out_tokens,
-                    'pre_response':pre_response
-                    }
+            out_dict['inp_tokens'] = inp_tokens
+            out_dict['out_tokens'] = out_tokens
+
+        elif self.answer_generator == 'mistral_8x7': ## Use Mistral 8x7b
+            messages = [{'role':'user','content':instruction}]
+            final_message = fs_messages + messages
+            formatted_message = self.ans_tokenizer.apply_chat_template(final_message,tokenize=False,add_generation_prompt=True)
+            ans_gen_kwargs = {'max_new_tokens':self.max_response_tokens,
+                              'do_sample':False,
+                              }
+            response = self.ans_generator.text_generation(formatted_message,**ans_gen_kwargs)
+            if '</s>' in response:
+                response = response.split('</s>')[0].strip()
+            out_dict['chosen_ans'] = response
+            
+        return out_dict
         
     def cluster_semantic_sets(self,instruction,all_responses):
         """
@@ -328,17 +415,19 @@ class NLIScorer:
             pred_label = torch.argmax(pred_probs,dim=1).numpy()
             entailed_probs = pred_probs[:,2].numpy().reshape(-1,2).mean(axis=1) # mean the probs of entailment
             pred_label = pred_label.reshape(-1,2) # reshape to get reverse and forward
-            entailed = np.all(pred_label == 2,axis=1) # if both directions are entailment, then it is entailed
+            semantically_different = np.any(pred_label == 0,axis=1) # if any is contradiction, then it is semantically different
+            semantically_similar = ~semantically_different
             
-            cluster_ids = list(cluster_comparsions.keys())
-            all_entailed_probs = entailed_probs[entailed]
-            all_entailed_ids = (np.array(cluster_ids)[entailed]).tolist()
-            if len(all_entailed_probs) > 0:
-                max_entailed_id = all_entailed_ids[np.argmax(all_entailed_probs)] # get the cluster id with the highest entailed prob
-                cluster_set[max_entailed_id].append(response)
-            else:
+            if np.all(semantically_different): # if all are semantically different, then create a new cluster
                 cluster_set[current_set_id] = [response]
                 current_set_id+=1
+            else: # they is a cluster with similar meaning
+                cluster_ids = list(cluster_comparsions.keys())
+                all_entailed_probs = entailed_probs[semantically_similar]
+                all_entailed_ids = (np.array(cluster_ids)[semantically_similar]).tolist()
+                max_entailed_id = all_entailed_ids[np.argmax(all_entailed_probs)] # get the cluster id with the highest entailed prob
+                cluster_set[max_entailed_id].append(response)
+            
         return cluster_set
     
     def get_cluster_entropy(self,semantic_cluster,responses_logprobs):
@@ -357,8 +446,8 @@ class NLIScorer:
             cluster_logprobs = []
             for response in semantic_responses:
                 joint_logprobs = responses_logprobs[response]
-                cluster_logprobs.append(torch.tensor(joint_logprobs,dtype = torch.float32)) # convert to higher precision
-            cluster_logprobs = torch.logsumexp(torch.stack(cluster_logprobs),dim=0) # sum logprobs over all responses within the cluster = log(sum(p(s|x)))
+                cluster_logprobs.append(joint_logprobs) # convert to higher precision
+            cluster_logprobs = torch.logsumexp(cluster_logprobs,dim=0) # sum logprobs over all responses within the cluster = log(sum(p(s|x)))
             overall_entropies.append(cluster_logprobs)
             
             cluster_entropy = -(cluster_logprobs * torch.exp(cluster_logprobs)) # - log(sum(p(s|x))) * sum(p(s|x))
@@ -402,24 +491,8 @@ class QAScorer(): # to score documents using a QA answering system
         return []
 
     def score_document(self, question: str, links: str):
-        def get_documents(link_dict):
-            link = link_dict['link']
-            try:
-                article = Article(link)
-                article.download()
-                article.parse()
-                article.nlp()
-                if not article.text:
-                    full_text =  None
-                else:
-                    full_text =  article.text
-            except Exception as e:
-                full_text =  None
-            link_dict['document'] = full_text
-            return link_dict
-        
         all_inps = [{'link':l} for l in links]
-        all_inps = async_process(get_documents,all_inps,workers = 16)
+        all_inps = async_process(self.get_documents,all_inps,workers = 16)
         success_documents = [x for x in all_inps if x['document'] is not None]
         out = []
         for i in range(0, len(success_documents), self.max_batch_size):
@@ -437,6 +510,22 @@ class QAScorer(): # to score documents using a QA answering system
             out.extend(current_batch)
         out = [o for o in out if o['answer'] is not None]
         return out
+    
+    def get_documents(self,link_dict):
+        link = link_dict['link']
+        try:
+            article = Article(link)
+            article.download()
+            article.parse()
+            article.nlp()
+            if not article.text:
+                full_text =  None
+            else:
+                full_text =  article.text
+        except Exception as e:
+            full_text =  None
+        link_dict['document'] = full_text
+        return link_dict
 
     def get_scored_document(self, question):
         links = self.search_engine_fn(question)
@@ -457,6 +546,7 @@ class LLMJudge(): # use GPT3.5/4 to judge 2 given responses
     def get_openai_choice(self,messages):
         message = messages['message']
         chosen_choice = messages['chosen_choice']
+        instr = messages['instruction']
         response = None
         try:
             response = self.client.chat.completions.create(
@@ -475,6 +565,7 @@ class LLMJudge(): # use GPT3.5/4 to judge 2 given responses
                     )
         if response is None:
             return {'result':None,
+                    'instr': instr,
                     'in':0,
                     'out':0}
         resp =  response.choices[0].message.content
@@ -485,6 +576,7 @@ class LLMJudge(): # use GPT3.5/4 to judge 2 given responses
         else:
             result = 0
         return {'result':result,
+                'instr': instr,
                 'in':inp_tokens,
                 'out':out_tokens}
         
@@ -504,10 +596,14 @@ class LLMJudge(): # use GPT3.5/4 to judge 2 given responses
                 
             curr_content = deepcopy(self.eval_prompt)
             curr_content[1]['content'] = curr_content[1]['content'].format(question = instruction,response_a = response_a,response_b = response_b)
-            all_messages.append({'message':curr_content,'chosen_choice':random_chosen})
+            all_messages.append({'message':curr_content,'chosen_choice':random_chosen,'instruction':instruction})
         
         results = async_process(self.get_openai_choice,all_messages,self.max_concurrent_calls)
-        scores = [r['result'] for r in results if r['result'] is not None]
+        results = [r for r in results if r['result'] is not None]
+        instr2_score = {}
+        for r in results:
+            instr2_score[r['instr']] = r['result']
+        mean_score = sum(list(instr2_score.values()))/len(list(instr2_score.values()))
         total_in_tokens = sum([r['in'] for r in results])
         total_out_tokens = sum([r['out'] for r in results])
         
@@ -517,7 +613,7 @@ class LLMJudge(): # use GPT3.5/4 to judge 2 given responses
         else:
             cost = 0.0005 * (total_in_tokens/1000) + 0.0015 * (total_out_tokens/1000)
         
-        return sum(scores)/len(scores),round(cost,3)
+        return mean_score,instr2_score,round(cost,3)
         
         
             

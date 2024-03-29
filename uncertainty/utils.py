@@ -1,10 +1,7 @@
 from transformers import pipeline,AutoModelForCausalLM, AutoTokenizer,BitsAndBytesConfig
 import torch
 import re
-from peft import LoraConfig, PeftModel,AutoPeftModelForCausalLM
-from collections import defaultdict
 import concurrent.futures
-from functools import partial
 import os
 from sentence_transformers import SentenceTransformer
 import nltk
@@ -12,9 +9,14 @@ import pickle
 from nltk.corpus import wordnet as wn
 from typing import List, Dict
 from scipy.spatial import KDTree
+from accelerate import Accelerator
+import random
+from tqdm import tqdm
 
-def load_hf_model(model_name,model_path=None,use_tgi=False): ## if use tgi, dont quantize.
-    if not use_tgi:
+SCORE_KEY = {'semantic_consistency':'entropy','BSDetector':'confidence','SelfCheckGPT':'hallucination'}
+
+def load_hf_model(model_name,quantized=False): ## if use tgi, dont quantize.
+    if quantized:
         bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -31,16 +33,6 @@ def load_hf_model(model_name,model_path=None,use_tgi=False): ## if use tgi, dont
     trust_remote_code=True,
     device_map= "cuda" if torch.cuda.is_available() else "cpu"
     )
-
-    if model_path is not None:
-        file_names = os.listdir(model_path)
-        if 'adapter_model.safetensors' in file_names: # if not merged, we merge it.
-            peft_model = PeftModel.from_pretrained(
-                model=base_model,
-                model_id = model_path,
-                is_trainable=False,
-            )
-            base_model = peft_model.merge_and_unload()
     return base_model
 
 def load_tokenizer(model_name,padding_side = "left"):
@@ -49,6 +41,15 @@ def load_tokenizer(model_name,padding_side = "left"):
         use_fast=True,
         padding_side = padding_side)
     tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.model_max_length = 2048
+    if 'mistral-7b' in model_name.lower():
+        if 'instruct' not in model_name.lower():
+            chat_template = "{{ bos_token }}{% for message in messages %}{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}{% endif %}{% if message['role'] == 'user' %}{{ '[INST] ' + message['content'] + ' [/INST]' }}{% elif message['role'] == 'assistant' %}{{ message['content'] + eos_token + ' ' }}{% else %}{{ raise_exception('Only user and assistant roles are supported!') }}{% endif %}{% endfor %}"
+            tokenizer.chat_template = chat_template
+    elif 'llama' in model_name.lower():
+        if 'chat' not in model_name.lower():
+            chat_template = "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}"
+            tokenizer.chat_template = chat_template
     return tokenizer
     
 
@@ -57,51 +58,165 @@ def tgi_to_gen_kwargs(gen_kwargs): # convert TGI kwargs to HF kwargs
         gen_kwargs.pop('details')
     if 'best_of' in gen_kwargs:
         gen_kwargs['num_return_sequences'] = gen_kwargs.pop('best_of')
-    gen_kwargs['return_dict_in_generate'] = True
-    gen_kwargs['output_scores'] = True
     return gen_kwargs
 
-def HF_generate(inps,model,tokenizer,gen_kwargs,extract_ans_fn,max_length=4096,use_tgi=False): # basic HF stype generate, with option of using TGI
+def HF_generate(inps,model,tokenizer,gen_kwargs,use_tgi=False,return_probs=False,max_workers= 64,return_as_dict=True,dict_keys={},msg=''):
+    """
+    Takes in the entire set of inputs and batch it using standard HF generation, else async with tgi API.
+    if return_probs, return as a dict for each sample if not using TGI, else logprobs can be directly accessed via the object returned by TGI.
+    if return_as_dict, return as a dict with all original items, along with the new output specified by 'output' key, input is specified by 'input' else just returns the output.
+    """
+    if return_as_dict:
+        assert dict_keys != {}, 'input_key must be provided if return_as_dict is True'
     if not use_tgi:
-        tokenized_inps = tokenizer(inps, padding='longest', return_tensors="pt",truncation=False).to(model.device)
-        gen_kwargs = {'return_dict_in_generate':True,'output_scores':True, **gen_kwargs}
-        with torch.no_grad():
-            model_outputs = model.generate(**tokenized_inps, **gen_kwargs)
-        transition_scores = model.compute_transition_scores(model_outputs.sequences, model_outputs.scores, normalize_logits=True) # Log probs of transitions
-        decoded =  tokenizer.batch_decode(model_outputs.sequences, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-        return [{'text':extract_ans_fn(d),'logprobs':lp} for d,lp in zip(decoded,transition_scores.detach().cpu().numpy())]
+        gen_kwargs = tgi_to_gen_kwargs(gen_kwargs)
+        out = []
+        for batch_i in tqdm(range(0,len(inps),max_workers),total =len(inps)//max_workers,desc=msg):
+            inp_batch = inps[batch_i:batch_i+max_workers]
+            out_key = dict_keys.get('output',None)
+            if return_as_dict:
+                inp_key = dict_keys['input']
+                inp_b = [inp[inp_key] for inp in inp_batch]
+            else:
+                inp_b = inp_batch
+            tokenized_inps = tokenizer(inp_b, padding='longest', return_tensors="pt",truncation=False).to(model.device)
+            if return_probs:
+                gen_kwargs = {'return_dict_in_generate':True,'output_scores':True, **gen_kwargs}
+            with torch.no_grad():
+                model_outputs = model.generate(**tokenized_inps, **gen_kwargs)
+            decoded = tokenizer.batch_decode(model_outputs.sequences[:,tokenized_inps.input_ids.shape[1]:], skip_special_tokens=True, clean_up_tokenization_spaces=True)
+            if return_probs:
+                transition_scores = model.compute_transition_scores(model_outputs.sequences, model_outputs.scores, normalize_logits=True)
+                logprobs = transition_scores.detach().cpu().numpy()
+            else:
+                logprobs = None
+            if gen_kwargs.get('num_return_sequences',1) > 1:
+                num_seq = gen_kwargs['num_return_sequences']
+                decoded = [d[i:i+num_seq] for i in range(0,len(d),num_seq)]
+                if logprobs is not None:
+                    logprobs = [lp[i:i+num_seq] for i in range(0,logprobs.shape[0],num_seq)]
+            if logprobs is not None:
+                for d,lp,inp_b in zip(decoded,logprobs,inp_batch):
+                    if return_as_dict:
+                        out.append({out_key:{'text':d,'logprobs':lp},**{k:v for k,v in inp_b.items() if k != inp_key}})
+                    else:
+                        out.append({'text':d,'logprobs':lp,**inp_b})
+            else:
+                for d,inp_b in zip(decoded,inp_batch):
+                    if return_as_dict:
+                        out.append({out_key:d,**{k:v for k,v in inp_b.items() if k != inp_key}})
+                    else:
+                        out.append(d)
+        return out
     else:
-        return tgi_generate(inps,model,gen_kwargs)
+        return tgi_generate(inps,model,gen_kwargs,max_workers,return_as_dict=return_as_dict,dict_keys=dict_keys,msg=msg)
 
-def tgi_generate(inps,model,gen_kwargs): # Using TGI to generate
-    def tgi_generate(prompt):
-        return model.text_generation(prompt, **gen_kwargs)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(inps)) as executor:
-        out = list(executor.map(tgi_generate,inps))
+def tgi_generate(inps,model,gen_kwargs,max_workers,return_as_dict=True,dict_keys={},msg = ''): # Using TGI to generate
+    def tgi_generate(inputs):
+        if return_as_dict:
+            prompt = inputs[dict_keys['input']]
+            gen = model.text_generation(prompt, **gen_kwargs)
+            inputs.pop(dict_keys['input'])
+            return {dict_keys['output']:gen,**inputs}
+        else:
+            return model.text_generation(inputs, **gen_kwargs)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(inps),max_workers)) as executor:
+        if msg != '':
+            out = list(tqdm(executor.map(tgi_generate,inps),total = len(inps),desc = msg))
+        else:
+            out = list(executor.map(tgi_generate,inps))
     return out
 
 
-def get_prompt_and_extract_template(model_name): # get input template and decode extraction (not needed for TGI)
+def get_extract_template(model_name,instruction_tuned): # get extract template (only used if TGI not used)
+    if instruction_tuned:
+        if 'neural-chat-7b' in model_name:
+            extract_fn = lambda x: x.split("### Assistant:\n")[-1].strip()
+        elif 'Mistral' in model_name or 'zephyr' in model_name:
+            extract_fn = lambda x : x.split(" [/INST]")[-1].strip()
+        elif 'Llama' in model_name:
+            extract_fn = lambda x: x.split("<|assistant|>\n")[-1].strip()
+        else:
+            extract_fn = lambda x: x
+    else:
+        extract_fn = lambda x: x.split('Q:')[0].strip()
+        
+    return extract_fn
+
+def format_response(response,model_name,tokenizer,mode = 'question'):
     """
-    Prompt_type = [answer_gen, question_gen]
-    answer_gen = no system prompt. User prompt is the only input
-    question_gen include a system prompt to remind the model that it is a student and is curious.
+    if mode = question, add system prompt and generation
+    if mode = answer, add generation
+    if model = label, add nothing.
+    response is assumed to already be in [{'role':'user','content':str}]
     """
-    system_prompt = "You are a student who is eager to learn about new things."
-    template_dict = defaultdict(dict)
-    if 'neural-chat-7b' in model_name:
-        template_dict['prompt_fn']['answer_gen'] = lambda x: f"### System:\n### User:\n{x}\n### Assistant:\n"
-        template_dict['prompt_fn']['question_gen'] = lambda x: f"### System:\n{system_prompt}\n### User:\n{x}\n### Assistant:\n"
-        template_dict['extract_ans_fn'] = lambda x: x.split("### Assistant:\n")[-1].strip()
-    elif 'Mistral' in model_name:
-        template_dict['prompt_fn']['answer_gen'] = lambda x: f"<s>[INST] {x} [/INST]"
-        template_dict['prompt_fn']['question_gen'] = lambda x: "<s>[INST] You are a student who is eager to learn about new things. [/INST]"+ "I am a student who is eager to learn about new things. I am aware of my lack of knowledge about some things.</s> " + f"[INST] {x} [/INST]"
-        template_dict['extract_ans_fn'] = lambda x : x.split(" [/INST]")[-1].strip()
+    if mode == 'question':
+        system_prompt = "You are a student who is eager to learn about new things." # only use if question generation
+    else:
+        system_prompt = ""
+    
+    if 'neural-chat-7b' in model_name or 'Llama' in model_name: # Mistral doesnt have system prompt
+        sys_msg = [{'role':'system','content':system_prompt}]
+        response = sys_msg + response
+    if mode != 'label':
+        formatted_msg = tokenizer.apply_chat_template(response,tokenize=False,add_generation_prompt=True)
+    else:
+        formatted_msg = tokenizer.apply_chat_template(response,tokenize=False,add_generation_prompt=False)
+    
+    return formatted_msg
+
+def format_fs_qa(few_shot,instruct_tuned=False):
+    all_fs =[]
+    random.shuffle(few_shot)
+    for fs in few_shot:
+        q = fs.instruction
+        if hasattr(fs,'choices'):
+            a = fs.choices[fs.answer] # answer is index of choice
+        else:
+            a = fs.answer # else is just answer 
+        if instruct_tuned:
+            all_fs.extend([{'role':'user','content':q},
+                            {'role':'assistant','content':a}])
+        else:
+            all_fs.append(f"Q: {q}\nA: {a}")
+    return all_fs
+        
+
+def format_instruction_response(model_name): # only used for SFT training
+    """
+    Add markers directly without chat template
+    return the formatting func and response_fn
+    """
+    if 'mistral' in model_name:
+        return "<s>[INST] {instruction} [/INST] {output}</s>", "[/INST]"
     elif 'Llama' in model_name:
-        template_dict['prompt_fn']['answer_gen'] =  lambda x: f"<|system|>\n<|user|>\n{x}\n<|assistant|>\n"
-        template_dict['prompt_fn']['question_gen'] =  lambda x: f"<|system|>\nYou are a student who is eager to learn about new things.</s>\n<|user|>\n{x}</s>\n<|assistant|>\n"
-        template_dict['extract_ans_fn'] = lambda x: x.split("<|assistant|>\n")[-1].strip()
-    return template_dict
+        return "<|user|>\n{instruction}</s>\n<|assistant|>\n{output}</s>", "<|assistant|>"
+
+def clean_question(question,len_fs):
+    """
+    given question in "question\n{digit}: question\n{digit+1} ..."
+    return question, digit should be > len_fs
+    """
+    # if 'question:' in question.lower():
+    #     take_pos = question.lower().find('question:') + len('question:')
+    #     question = question[take_pos:].strip()
+    match = re.search(r'(\d+):', question)
+    if match:
+        digit = int(match.group(1))  # Convert the found digits to an integer
+        if digit > len_fs:
+            # If the digit is above the threshold, extract everything before the digit
+            return question[:match.start()].strip()
+        else:
+            return question.split('\n\n')[0].strip()
+    else:
+        return question.split('\n\n')[0].strip()
+
+def clean_answer(answer):
+    if 'Q:' in answer: # Clean off excess text
+        answer = answer.split('Q:')[0].strip()
+    else:
+        answer.split('\n\n')[0].strip()
+    return answer
 
 def extract_str_in_bracket(x):
     pattern = r"\((.*?)\)"
@@ -138,3 +253,41 @@ def get_topic_embedding_space(all_embeddings: List) -> KDTree:
     all_embeddings = torch.tensor(all_embeddings)
     all_embeddings = torch.nn.functional.normalize(all_embeddings, p=1, dim=-1)
     return KDTree(all_embeddings)
+
+def get_current_device() -> int:
+    """Get the current device. For GPU we return the local process index to enable multiple GPU training."""
+    return Accelerator().local_process_index if torch.cuda.is_available() else "cpu"
+
+def get_kbit_device_map() -> Dict[str, int] | None:
+    """Useful for running inference with quantized models by setting `device_map=get_peft_device_map()`"""
+    return {"": get_current_device()} if torch.cuda.is_available() else None
+
+def if_instruction_tuned(model_name):
+    if 'mistral-7b' in model_name.lower():
+        if 'instruct' in model_name.lower():
+            return True
+        else:
+            return False
+    elif 'llama' in model_name.lower():
+        if 'chat' in model_name.lower():
+            return True
+        else:
+            return False
+    elif 'mixtral-8x7b' in model_name.lower():
+        return True
+    else:
+        raise NotImplementedError
+
+def return_question_type(data,scoring_method,type_ = 'unknown'):
+    if scoring_method == 'semantic_consistency':
+        unknown_qns = [x for x in data if len(list(x['semantic_clusters'].keys())) >1] # remove questions with only 1 cluster since we cant select rejected/chosen from 1 cluster.
+        known_qns = [x for x in data if len(list(x['semantic_clusters'].keys())) == 1]
+    elif scoring_method == 'BSDetector':
+        unknown_qns = [x for x in data if x['confidence'] < 0.5] # remove questions with confidence > 0.5
+        known_qns = [x for x in data if x['confidence'] >= 0.5]
+    elif scoring_method == 'SelfCheckGPT':
+        unknown_qns = [x for x in data if x['hallucination'] >= 0.5] # remove questions with confidence > 0.5
+        known_qns = [x for x in data if x['hallucination'] < 0.5]
+    if type_ == 'unknown':
+        return unknown_qns
+    return known_qns

@@ -1,5 +1,14 @@
 data
 model_checkpoints
+model_checkpoints_full
 test_results
 cuda_dev
 mem.py
+scripts
+openai_api_key.txt
+uncertainty/test_code.py
+uncertainty/create_catastrophic_ds.py
+roberta_stopwords.txt
+.cache
+
+
