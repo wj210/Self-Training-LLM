@@ -1,23 +1,51 @@
-# self-learning-llm
+# Self-Learning-llm
 
 Code adapted from https://github.com/teddy-f-47/self-learning-llm-public
 
-Main code in `uncertainty`, scripts to run are in `scripts`
+Main code in `uncertainty`, scripts to run are in `script`
+
+**Important files**
+- `wiki_ques_gen.sh`- creates dataset
+- `train.sh` - train either based on ds saved under '/train' folder
+- `test.sh` - do testing
+- `tgi.sh` - setup the model api to do fast-inference (recommended)
 
 **Requirements**
-Additional packages from preivous code include `openai, tensorboardX`.
+- run `pip install -r requirements.txt`
+- Follow https://github.com/google-research/bleurt to install bleurt to evaluate truthful_qa
+- if factscore is not installed correctly, follow https://github.com/shmsw25/FActScore
+- If using TGI - install by following https://github.com/huggingface/text-generation-inference?tab=readme-ov-file#local-install
 
-**Layout**
 
-`main.py` does the following
+**Data Generation**
 
-1) Generate topic embedding space and samples `num_iterations`*`topic_ratio` where topic ratio = questions/topic. Saved
-2) Generate `num_iterations` questions as well as greedy and sampled answers. Questions are scored by choice of `scoring_method` and filtered with top `filter_size` are used to form Q_H
-3) Generate chosen labels for DPO using the choice of `answer_generator`.
-4) Perform training by setting `training` to true.
-5) Perform testing by setting `testing` to true. The `test_keys`:'answer_confidence' evaluates confidence on test set, 'question_confidence' on confidence score of generated questions using same topic as training set. `answer_performance` uses GPT4 to score pairwise ranking.
+`wiki_ques_gen.sh` does the following:
+
+1) Sample topics based on `num_topics` and generate `questions_per_topic` qn per topic, given the wiki document relating to each topic 
+2) Check for duplicates based on rouge and split into train and test set.
+3) On the train set, generate both reference(greedy decoded and given supporting document) and `num_samples` sampled responses w/o the document
+4) Compute a form of hallucination score based on `scoring_method` set.
+5) Split into known and unknown questions and save them.
+6) Generate the dpo training set only on unknown questions, the 'chosen labels' are generated based on `answer_generator` set, default uses the reference as chosen, if set gpt4 or gpt3.5, will use them to generate labels in place of the reference generated above. In theory, the self-generated answer should be good enough since the model is given additional context as help while the 'rejected' is chosen from the set of sampled responses based on hallucination score, ie the response which contradicts the chosen the most is set as rejected.
+
+**Training**
+
+- `train.sh` can train using either PEFT or full parameter training , set the `use_peft` flag. parameters set in `configs/training/lora.yaml`
+- Dpo or sft in `configs/training`
+- If multi_gpu for full parameter, in `configs/deepspeed.yaml`
+- model config is in `configs/model`
+
+**Testing**
+
+run `script/test.sh`, the parameters are specified inside.
 
 **Faster Inference**
+- The code uses TGI for for either data generation or testing. The inference is much faster than standard way of loading model and doing batch generation with `model.generate`.
+- The only troublesome part is that the model have to be first loaded, by running `tgi.sh` and then running the main script. So if we want to do testing with 2 different models, we have to setup first model -> testing -> unset first model and set 2nd -> testing.
+- `tgi.sh` basically sets up the model on your local hardware for you to make API calls (similar to making it via OpenAI). The code is setup to do multi-threading to increase inference speed.
 
-The code uses TGI for step 2 and 3(for self-generated), which is much faster than standard HF generate function.
+**Added data**
+
+For convenience sake, added ~2k generated data using SelfCheckGPT and self-generated answer method in data, as well as the held-out test set. Can do training immmediately by running `train.sh` as it is.
+
 
