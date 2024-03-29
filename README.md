@@ -44,4 +44,8 @@ run `script/test.sh`, the parameters are specified inside.
 - The only troublesome part is that the model have to be first loaded, by running `tgi.sh` and then running the main script. So if we want to do testing with 2 different models, we have to setup first model -> testing -> unset first model and set 2nd -> testing.
 - `tgi.sh` basically sets up the model on your local hardware for you to make API calls (similar to making it via OpenAI). The code is setup to do multi-threading to increase inference speed.
 
+**Added data**
+
+For convenience sake, added ~2k generated data using SelfCheckGPT and self-generated answer method in data, as well as the held-out test set. Can do training immmediately by running `train.sh` as it is.
+
 
