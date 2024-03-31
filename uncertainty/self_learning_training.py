@@ -241,13 +241,12 @@ def do_train(
                     saved_model_path,
                     torch_dtype=torch.float16,
                     low_cpu_mem_usage=True)  
-        base_model = peft_model.merge_and_unload()
-        base_model = base_model.cpu()
+        merged_model = peft_model.merge_and_unload(progressbar=True)
         for os_file in os.listdir(saved_model_path): # remove the adapter files.
             # if Accelerator().is_main_process:
             if 'adapter' in os_file:
                 os.remove(os.path.join(saved_model_path, os_file))
-        base_model.save_pretrained(saved_model_path)
+        merged_model.save_pretrained(saved_model_path)
     # wandb.finish()
 
 

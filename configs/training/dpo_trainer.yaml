@@ -1,13 +1,13 @@
 mode: dpo
 eval_split: 0.1
 bf16: true
-beta: 0.1
+beta: 0.5
 do_eval: true
 do_train: true
 overwrite_output_dir: true
 gradient_accumulation_steps: 2
 gradient_checkpointing: true
-learning_rate: 1.0e-6
+learning_rate: 5.0e-7
 log_level: info
 logging_steps: 10
 lr_scheduler_type: linear
