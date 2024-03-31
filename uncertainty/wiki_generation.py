@@ -240,7 +240,7 @@ def main():
     config.answer_generator = args.answer_generator
     config.scoring_method = args.scoring_method
     
-    ## Generate kwargs ##
+    ## Generate kwargs
     gen_kwargs = {'topic':{'max_new_tokens':5, 'do_sample':True, 'temperature':1.0,'repetition_penalty':1.1},
                     'questions':{'max_new_tokens':ds_config.get('max_question_tokens',128), 'do_sample':True, 'temperature':1.0,'repetition_penalty':1.1,'details':True,'best_of':args.questions_per_topic},
                     'ref_answer':{'max_new_tokens':ds_config.get('max_response_tokens',128), 'do_sample':False, 'repetition_penalty':1.1,'details':True},
