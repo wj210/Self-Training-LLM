@@ -1,0 +1,11 @@
+ds_name: cais/mmlu
+test_split: test
+test_dataset_path: data/{dataset_name}/test.jsonl
+fs_path: data/{dataset_name}/fs_shot.pkl
+subset: all
+answer_type: likelihood
+few_shot: 8 # for question/answer generation
+test_few_shot: 5 # how many fs to use for testing
+max_response_tokens: 128
+max_question_tokens: 256
+gen_kwargs: {'do_sample':False,'max_new_tokens':1,'temperature':1.0}
