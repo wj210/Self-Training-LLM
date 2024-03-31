@@ -46,6 +46,8 @@ run `script/test.sh`, the parameters are specified inside.
 
 **Added data**
 
-For convenience sake, added ~2k generated data using SelfCheckGPT and self-generated answer method in data, as well as the held-out test set. Can do training immmediately by running `train.sh` as it is.
+For convenience sake, added ~14k unknown train set using SelfCheckGPT and self-generated answer method in data, as well as the held-out test set. Can do training immmediately by running `train.sh` as it is.
+
+Link: https://drive.google.com/drive/folders/1IeR7qUy9Shgmlbb24OPDyl7QuWh-MJDB?usp=drive_link
 
 
