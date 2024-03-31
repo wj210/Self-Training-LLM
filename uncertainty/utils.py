@@ -4,14 +4,13 @@ import re
 import concurrent.futures
 import os
 from sentence_transformers import SentenceTransformer
-import nltk
 import pickle
-from nltk.corpus import wordnet as wn
 from typing import List, Dict
 from scipy.spatial import KDTree
 from accelerate import Accelerator
 import random
 from tqdm import tqdm
+from openai import OpenAI
 
 SCORE_KEY = {'semantic_consistency':'entropy','BSDetector':'confidence','SelfCheckGPT':'hallucination'}
 
@@ -51,6 +50,35 @@ def load_tokenizer(model_name,padding_side = "left"):
             chat_template = "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}"
             tokenizer.chat_template = chat_template
     return tokenizer
+
+def openai_call(model,message,max_tokens,temperature=0.):
+    client = OpenAI()
+    max_calls = 5
+    num_calls = 0
+    while True:
+        if num_calls >= max_calls:
+            return None
+        try:
+            prompt = [m['content'] for m in message if m['role'] == 'user'][0]
+            if 'instruct' in model.lower():
+                response = client.completions.create(
+                model=model,
+                prompt=prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                )
+                return response.choices[0].text
+            else:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=message,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    )
+                return response.choices[0].message.content 
+        except Exception as e:
+            num_calls += 1
+            print(f'Failing Openai call due to {e}, remaining calls: {max_calls - num_calls}')
     
 
 def tgi_to_gen_kwargs(gen_kwargs): # convert TGI kwargs to HF kwargs
@@ -100,7 +128,7 @@ def HF_generate(inps,model,tokenizer,gen_kwargs,use_tgi=False,return_probs=False
                     if return_as_dict:
                         out.append({out_key:{'text':d,'logprobs':lp},**{k:v for k,v in inp_b.items() if k != inp_key}})
                     else:
-                        out.append({'text':d,'logprobs':lp,**inp_b})
+                        out.append({'text':d,'logprobs':lp})
             else:
                 for d,inp_b in zip(decoded,inp_batch):
                     if return_as_dict:
@@ -228,7 +256,8 @@ def extract_str_in_bracket(x):
         return x
 
 def get_nouns_and_embeddings(embedder: SentenceTransformer) -> Dict:
-    nltk.download('omw-1.4')
+    # nltk.download('omw-1.4')
+    from nltk.corpus import wordnet as wn
     dir_storage = "data"
     os.makedirs(dir_storage, exist_ok=True)
     wordnet_data_path = dir_storage + "/wordnet_data.pkl"

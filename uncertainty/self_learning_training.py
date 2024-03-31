@@ -87,6 +87,7 @@ def do_train(
         max_steps = -1,
         saved_model_path=None,
         max_response_len=256,
+        max_prompt_len=-1,
         use_peft=False,
         peft_path=None,
         train_args_path=None,
@@ -97,8 +98,8 @@ def do_train(
     bnb_config = None
     if use_peft: 
         with open(peft_path, 'r') as f:
-            peft_config = yaml.safe_load(f)
-        if peft_config['quantized']:       
+            peft_config_dict = yaml.safe_load(f)
+        if peft_config_dict['quantized']:       
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
@@ -121,6 +122,8 @@ def do_train(
         available_trainer_args['warmup_steps'] = int(0.1 * max_steps)
         available_trainer_args['evaluation_strategy'] = 'steps'
         available_trainer_args['eval_steps'] = int(0.2 * max_steps)
+    if max_prompt_len != -1:
+        train_args['max_prompt_length'] = max_prompt_len
         
     training_args = TrainingArguments(**available_trainer_args)
     if train_args['mode'] == 'sft': # smaller model lower lr
@@ -133,20 +136,23 @@ def do_train(
     val_ds = full_ds.select(range(len(full_ds)-eval_size,len(full_ds)))
     
     ## Print out first sample
+    accelerator = Accelerator()
+    is_main_process = accelerator.is_local_main_process
     random_train_sample = train_ds[0]
     random_eval_sample = val_ds[0]
-    if train_args['mode'] == 'sft':
-        print ('train prompt: ',random_train_sample['prompt'])
-        print ('train answer: ',random_train_sample['completion'])
-        print ('eval prompt: ',random_eval_sample['prompt'])
-        print ('eval answer: ',random_eval_sample['completion'])
-    elif train_args['mode'] == 'dpo':
-        print ('train prompt: ',random_train_sample['prompt'])
-        print ('train chosen: ',random_train_sample['chosen'])
-        print ('train rejected: ',random_train_sample['rejected'])
-        print ('eval prompt: ',random_eval_sample['prompt'])
-        print ('eval chosen: ',random_eval_sample['chosen'])
-        print ('eval rejected: ',random_eval_sample['rejected'])
+    if is_main_process:
+        if train_args['mode'] == 'sft':
+            print ('train prompt: ',random_train_sample['prompt'])
+            print ('train answer: ',random_train_sample['completion'])
+            print ('eval prompt: ',random_eval_sample['prompt'])
+            print ('eval answer: ',random_eval_sample['completion'])
+        elif train_args['mode'] == 'dpo':
+            print ('train prompt: ',random_train_sample['prompt'])
+            print ('train chosen: ',random_train_sample['chosen'])
+            print ('train rejected: ',random_train_sample['rejected'])
+            print ('eval prompt: ',random_eval_sample['prompt'])
+            print ('eval chosen: ',random_eval_sample['chosen'])
+            print ('eval rejected: ',random_eval_sample['rejected'])
         
     ## Model args
     model_kwargs = dict(
@@ -164,15 +170,16 @@ def do_train(
     # Setup PEFT config
     if use_peft:
         peft_config = LoraConfig(
-            r=peft_config['lora_r'],
-            lora_alpha=peft_config['lora_alpha'],
-            lora_dropout=peft_config['lora_dropout'],
-            target_modules=peft_config['lora_layers'],
+            r=peft_config_dict['lora_r'],
+            lora_alpha=peft_config_dict['lora_alpha'],
+            lora_dropout=peft_config_dict['lora_dropout'],
+            target_modules=peft_config_dict['lora_layers'],
             bias="none",
             task_type="CAUSAL_LM",
         )
         model_ref = None
         ref_model_kwargs = None
+        training_args.learning_rate = peft_config_dict['learning_rate'] # peft uses higher learning rate
         
     else:
         peft_config = None
@@ -240,7 +247,7 @@ def do_train(
             # if Accelerator().is_main_process:
             if 'adapter' in os_file:
                 os.remove(os.path.join(saved_model_path, os_file))
-            base_model.save_pretrained(saved_model_path)
+        base_model.save_pretrained(saved_model_path)
     # wandb.finish()
 
 

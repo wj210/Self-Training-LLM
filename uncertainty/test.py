@@ -9,6 +9,9 @@ from utils import *
 from data_utils import *
 from eval import eval_fixed_ds
 from copy import deepcopy
+import torch
+import random
+import numpy as np
 
 
 
@@ -26,10 +29,15 @@ def main():
     parser.add_argument("--quantized",  type = bool,default = False,help = 'quantized model for inference')
     parser.add_argument("--trained",  type = bool,default = False,help = 'if trained, load model path else model_name')
     parser.add_argument("--test_question_per_topic",  type = int,default =-1,help = 'if more than -1, we only test on this number of questions per topic')
+    parser.add_argument("--num_samples", type=int, default=5,help = 'number of sampled responses')
     parser.add_argument("--extra_ds",  type = str,default =[],nargs = '+',help = 'test on datasets that are not trained on.')
     parser.add_argument("--filter_size",  type = float,default = 1.0,help = 'Top questions to take based on confidence/uncertainty')
     parser.add_argument("--openai_api_key_path",  type = str,default = '',help = 'a text file for openai api key, required only if using factscorer.')
     args = parser.parse_args()
+    ## Seed ## 
+    torch.manual_seed(42)
+    random.seed(42)
+    np.random.seed(42)
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
     
     with open(args.config_path,'r') as f: # model config
@@ -38,10 +46,8 @@ def main():
     ds_config = {}
     if 'fixed' in args.topic_generator or 'predefined' in args.topic_generator or 'oracle' in args.topic_generator: # data config.
         ds_name = '_'.join(args.topic_generator.split('_')[1:]) 
-    elif 'wiki' in args.topic_generator:
-        ds_name = 'wiki'
     else:
-        ds_name = 'self-generated'
+        ds_name = args.topic_generator
     ds_config_path = f'configs/data/{ds_name}.yaml'
     with open(ds_config_path,'r') as f:
         ds_config = yaml.safe_load(f)
@@ -77,10 +83,6 @@ def main():
     #     question_ds = pickle.load(f)
     # known_ds = return_question_type(question_ds,args.scoring_method,'known') # TODO Do hallucination testing with this.
     
-    ## Main Test dataset path ## (ignore for wiki)
-    ds_config['test_dataset_path'] = ds_config['test_dataset_path'].format(dataset_name = ds_name,
-                                                               test_qn_per_topic=args.test_question_per_topic)
-    
     # load model and tokenizer
     test_load_path = config.model_path if args.trained else config.model_name
     tokenizer = load_tokenizer(test_load_path,padding_side='left') 
@@ -97,18 +99,25 @@ def main():
     ds_kwargs = {'ds_name':ds_name}
     ds_kwargs['trained'] = args.trained
     
-    with open(ds_config['test_dataset_path'],'r') as f: 
-        test_dataset = [json.loads(line) for line in f]
-    ## Few shot generation      
-    test_num_fs = ds_config['test_few_shot']
-    if isinstance(test_num_fs,int):
-        if test_num_fs > 0:
-            with open(config.fs_path,'rb') as f:
-                test_fs_shot = pickle.load(f)
-        else:
-            test_fs_shot = []
+    ## Main Test dataset path ## (ignore for halueval)
+    if ds_name not in ['truthful_qa_mc','halueval']:
+        ds_config['test_dataset_path'] = ds_config['test_dataset_path'].format(dataset_name = ds_name,
+                                                                test_qn_per_topic=args.test_question_per_topic)
+        with open(ds_config['test_dataset_path'],'r') as f: 
+            test_dataset = [json.loads(line) for line in f]
     else:
-        test_fs_shot = test_num_fs # either list or str
+        test_dataset,test_fs_shot = load_test_ds(ds_config)
+    ## Few shot generation
+    if ds_name != 'truthful_qa_mc':
+        test_num_fs = ds_config['test_few_shot']
+        if isinstance(test_num_fs,int):
+            if test_num_fs > 0:
+                with open(config.fs_path,'rb') as f:
+                    test_fs_shot = pickle.load(f)
+            else:
+                test_fs_shot = []
+        else:
+            test_fs_shot = test_num_fs # either list or str
     
     ## FactScore.
     # if 'wiki' in args.topic_generator: # prepare data corpus for factscore if does not exist
@@ -166,7 +175,8 @@ def main():
             extra_test_ds,extra_test_fs = load_test_ds(extra_ds_config)
             e_ds_type = extra_ds_config['answer_type']
             ds_kwargs['ds_name'] = e_ds
-            extra_test_ds = [vars(d) for d in extra_test_ds] # convert to dict
+            if not isinstance(extra_test_ds[0],dict):
+                extra_test_ds = [vars(d) for d in extra_test_ds] # convert to dict
             extra_test_ds = dataset_class[e_ds_type](extra_test_ds,tokenizer,config.model_name,few_shots=extra_test_fs,kwargs=ds_kwargs)
             all_testing_dict[e_ds] = {'ds':extra_test_ds,
                                         'gen_kwargs':extra_ds_config['gen_kwargs'],
@@ -180,10 +190,9 @@ def main():
         else:
             model = load_hf_model(test_load_path,quantized=args.quantized).eval() 
         
-        if test_ds_name == 'wiki' and ds_dict['ds_type'] == 'generation': # only compute consistency score for generation ds.
+        if ds_dict['ds_type'] == 'generation' and ds_name != 'halueval': # only compute consistency score for generation ds.
             scorer = NLIScorer(model,config.model_name,tokenizer,args.scoring_method,1.0,max_response_tokens=ds_config.get('max_response_tokens',128),answer_generator=args.answer_generator,answer_generator_port=-1,ref_as_chosen=False)
             ds_dict['ds'].scorer = scorer
-        
         result_dict = eval_fixed_ds(ds_dict['ds'],
                         model,
                         config.model_name,
@@ -191,7 +200,7 @@ def main():
                         test_ds_name,
                         args.test_batch_size,
                         ds_type = ds_dict['ds_type'],
-                        num_samples = 10,
+                        num_samples = args.num_samples,
                         gen_kwargs = ds_dict['gen_kwargs'],
                         trained = args.trained,
                         use_tgi = args.use_tgi,

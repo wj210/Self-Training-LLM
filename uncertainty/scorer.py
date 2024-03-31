@@ -4,7 +4,7 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer,pipel
 from torch.nn.utils.rnn import pad_sequence
 import concurrent.futures
 from copy import deepcopy
-from utils import HF_generate,extract_str_in_bracket,clean_answer,if_instruction_tuned,format_response,format_fs_qa
+from utils import HF_generate,extract_str_in_bracket,clean_answer,if_instruction_tuned,format_response,format_fs_qa,openai_call
 from templates import self_reflection_prompt,self_answer_prompt
 from collections import defaultdict
 from functools import partial
@@ -123,6 +123,8 @@ class NLIScorer:
         else:
             sample_text = [s['text'] for s in sample_answer]
             ref_text = ref_answer['text']
+        if ref_text.strip() == '':
+            return None
         all_answers = [ref_text]+ sample_text
         # Clean the answers if not instruct tuned.
         if not if_instruction_tuned(self.gen_model_name):
@@ -347,31 +349,14 @@ class NLIScorer:
             out_dict['link'] = [x['link'] for x in scored_documents]
 
         elif self.answer_generator in ['gpt4','gpt3.5']: # use OPENAI GPT3.5/4 to generate answers
-            client = OpenAI()
             messages = [{'role':'user','content':instruction}]
-            print (instruction)
             final_message = fs_messages + messages
             engine = 'gpt-4-0125-preview' if 'gpt4' in self.answer_generator else 'gpt-3.5-turbo-0125'
-            try:
-                response = client.chat.completions.create(
-                model=engine,
-                messages=final_message,
-                temperature=0,
-                max_tokens=self.max_response_tokens,
-                )
-            except Exception as e:
-                time.sleep(2)
-                response = client.chat.completions.create(
-                model=engine,
-                messages=final_message,
-                temperature=0,
-                max_tokens=128,
-                )
-            out_dict['chosen_ans'] = response.choices[0].message.content
-            inp_tokens = response.usage.prompt_tokens
-            out_tokens = response.usage.completion_tokens
-            out_dict['inp_tokens'] = inp_tokens
-            out_dict['out_tokens'] = out_tokens
+            openai_ans = openai_call(engine,final_message,self.max_response_tokens)
+            if openai_ans is None:
+                return None
+            else:
+                out_dict['chosen_ans'] = openai_ans
 
         elif self.answer_generator == 'mistral_8x7': ## Use Mistral 8x7b
             messages = [{'role':'user','content':instruction}]

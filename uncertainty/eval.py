@@ -142,5 +142,7 @@ def eval_fixed_ds(ds,model,model_name,tokenizer,ds_name,batch_size,ds_type= 'lik
     if len(hallucination_score) > 0:
         if ds.scorer.scoring_method == 'BSDetector':
             result_dict['hallucination_score'] = 1. - np.mean(hallucination_score).item() # since confidence, take complement
+        else:
+            result_dict['hallucination_score'] = np.mean(hallucination_score).item()
     
     return result_dict

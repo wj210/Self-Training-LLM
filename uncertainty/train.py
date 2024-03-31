@@ -57,13 +57,6 @@ def main():
                                                 scoring_name=scoring_name,
                                                 filter_size = int(100*args.filter_size))
     os.makedirs(os.path.dirname(config.model_path),exist_ok=True)
-    
-    ## accelerator, only use this for training
-    accelerator = Accelerator()
-    num_gpus = accelerator.state.num_processes
-    is_main_process = accelerator.is_local_main_process
-    if num_gpus > 1 and is_main_process:
-        print ('Using multiple gpus for training: ',num_gpus)
     assert os.path.exists(config.train_dataset_path), f'{config.train_dataset_path} not found'
     
     with open(config.train_dataset_path,'r') as f:
@@ -85,6 +78,7 @@ def main():
         max_steps = args.max_steps,
         saved_model_path=config.model_path,
         max_response_len=ds_config.get('max_response_tokens',128),
+        max_prompt_len = ds_config.get('max_question_tokens',-1),
         use_peft = args.use_peft,
         peft_path = args.peft_path,
         train_args_path=args.training_args_path,

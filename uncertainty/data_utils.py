@@ -1,7 +1,6 @@
 from datasets import load_dataset,get_dataset_config_names, Dataset,concatenate_datasets,load_metric
 from collections import defaultdict
 from dataclasses import dataclass
-import yaml
 import torch
 from torch.nn.utils.rnn import pad_sequence
 import numpy as np
@@ -70,18 +69,24 @@ def is_duplicate(scorer,h,r_list,max_rouge=0.7):
         out = p.starmap(compute_rouge,compute_list)
     return np.max(out) > max_rouge
 
-def categorise_test_sample(ds_name,sample):
+def categorise_test_sample(ds_name,sample,type='generation'):
     if 'mmlu' in ds_name:
         return QA_sample(instruction=sample['question'],
                         choices=sample['choices'],
                         answer=sample['answer'],
                         topic=sample['subject'])
     elif 'truthful_qa' in ds_name:
-        return Generation_sample(instruction=sample['question'],
-                                answer=sample['best_answer'],
-                                correct_answer=sample['correct_answers'],
-                                incorrect_answer=sample['incorrect_answers'],
-                                topic=sample['category'])
+        if type == 'generation':
+            return Generation_sample(instruction=sample['question'],
+                                    answer=sample['best_answer'],
+                                    correct_answer=sample['correct_answers'],
+                                    incorrect_answer=sample['incorrect_answers'],
+                                    topic=sample['category'])
+        else:
+            return QA_sample(instruction=sample['question'],
+                            choices=sample['mc1_targets']['choices'],
+                            answer=sample['mc1_targets']['labels'].index(1),
+                            topic='truthful_qa_mc1')
     elif 'gsm8k' in ds_name:
         return Generation_sample(instruction=sample['question'],
                                 answer=sample['answer'],
@@ -98,17 +103,43 @@ def load_test_ds(config):
         test_ds = []
         for d in ds:
             if len(out_fs[d['subject']]) >= num_fs:
-                test_ds.append(categorise_test_sample(ds_name,d))
+                test_ds.append(vars(categorise_test_sample(ds_name,d)))
                 continue
-            out_fs[d['subject']].append(categorise_test_sample(ds_name,d))
+            out_fs[d['subject']].append(vars(categorise_test_sample(ds_name,d)))
     elif 'truthful_qa' in ds_name:
         ds = load_dataset(ds_name,config['subset'],split = config['test_split'])
-        test_ds = [categorise_test_sample(ds_name,d) for d in ds]
-        out_fs = num_fs # fs is already defined file.
+        test_ds = [vars(categorise_test_sample(ds_name,d,type=config['subset'])) for d in ds]
+        if config['subset'] =='generation':
+            out_fs = num_fs # fs is already defined file.
+        else:
+            out_fs = test_ds[:num_fs] # fs is the first num_fs samples for multiple_choice
+            test_ds = test_ds[num_fs:]
     elif 'wiki' in ds_name:
-        ds_path = 'data/wiki/test_400.jsonl'
+        ds_path = 'data/wiki/test.jsonl'
         with open(ds_path,'r') as f:
             test_ds = [json.loads(l) for l in f.readlines()]
+        out_fs = []
+    elif 'halueval' in ds_name:
+        ds_path = 'data/halueval/qa_data.jsonl'
+        with open(ds_path,'r') as f:
+            test_ds = [json.loads(l) for l in f.readlines()]
+        prefix_path = 'data/halueval/qa_evaluation_instruction.txt'
+        with open(prefix_path,'r', encoding="utf-8") as f:
+            prefix = f.read()
+        new_d = []
+        for d in test_ds:
+            if random.random() > 0.5:
+                chosen_answer = d["hallucinated_answer"]
+                answer = 'Yes'
+            else:
+                chosen_answer = d['right_answer']
+                answer = 'No'
+            question = prefix + "\n\n#Question#: " + d['question'] +"\n#Answer#: " + chosen_answer + "\n#Your Judgement#: "
+            new_d.append({'instruction':question,
+                          'answer':answer,
+                          'system_prompt':"You are a huallucination detector. You MUST determine if the provided answer contains hallucination or not for the question based on the world knowledge. The answer you provided MUST be Yes or No",
+                          'topic':'qa'})
+        test_ds = new_d
         out_fs = []
     else:
         raise ValueError(f'Unsupported dataset {ds_name}')
@@ -213,11 +244,12 @@ def get_fixed_ds(config,question_per_topic,test_qn_per_topic,generator_type=''):
         for d in test_ds:
             subject = d['category']
             test_sample = categorise_test_sample(ds_name,d)
-            if len(fs_ds[subject]) >= few_shot:
-                out_ds.append(test_sample)
-                continue
-            fs_ds[subject].append(test_sample)
-        defined_ds = None
+            # if len(fs_ds[subject]) >= few_shot:
+            out_ds.append(test_sample)
+                # continue
+            # fs_ds[subject].append(test_sample)
+            
+        defined_ds = out_ds
     
     ## GSM8K ##
     elif 'gsm8k' in ds_name:
@@ -252,6 +284,7 @@ class LikelihoodDS(torch.utils.data.Dataset):
         self.alpha2token = {chr(i+97).upper():self.tokenizer.encode(chr(i+97).upper(),add_special_tokens=False)[0] for i in range(26)}
         self.few_shots = few_shots
         self.trained = kwargs.get('trained',False)
+        self.ds_name = kwargs.get('ds_name',None)
         self.setup()
     
     def setup(self):
@@ -330,7 +363,10 @@ class LikelihoodDS(torch.utils.data.Dataset):
     
     def setup_fewshot(self,topic):
         few_shots = []
-        shuffled_few_shots = copy.deepcopy(self.few_shots[topic])
+        if self.ds_name == 'mmlu':
+            shuffled_few_shots = copy.deepcopy(self.few_shots[topic])
+        elif 'truthful_qa' in self.ds_name:
+            shuffled_few_shots = copy.deepcopy(self.few_shots)
         random.shuffle(shuffled_few_shots)
         for fs in shuffled_few_shots:
             few_shots.extend(self.format_instruction(fs,add_answer=True))
@@ -385,6 +421,10 @@ class GenerationDS(torch.utils.data.Dataset):
                           'incorrect_answer':d['incorrect_answer']}
             elif self.ds_name == 'wiki':
                 answer = d['document'] # no answer provided in wiki test set, only document
+            elif self.ds_name == 'halueval':
+                answer = d['answer']
+            else:
+                raise ValueError(f'Unsupported dataset {self.ds_name}')
             topic = d['topic']
             self.batched_ds.append({'instruction':formatted_instr,'answer':answer,'topic':topic})
             
@@ -419,6 +459,11 @@ class GenerationDS(torch.utils.data.Dataset):
                                          n = 2,
                                          batch_size = 8) # n is the number of examples to teach gpt to decompose facts.
             return fs_score
+        elif self.ds_name == 'halueval':
+            if answer.lower() in pred.lower().strip():
+                return 1
+            else:
+                return 0
         else:
             raise NotImplementedError(f'Scoring method not defined for {self.ds_name}')
             

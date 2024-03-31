@@ -10,7 +10,7 @@ import pickle
 import random
 from utils import *
 from data_utils import *
-from templates import format_question_generation,format_question_w_document,format_answer_w_document
+from templates import format_question_w_document,format_answer_w_document,truthful_qa_questions
 from functools import partial
 from copy import deepcopy
 from dataclasses import asdict
@@ -18,7 +18,7 @@ import yaml
 from rouge_score import rouge_scorer
 from types import SimpleNamespace
 
-def open_generate_qns(client,scorer,topics,document_dict,max_workers,gen_kwargs,tokenizer,model_name,question_path=None,test_path=None,test_size=1000,qn_per_topic=1,use_tgi=True):
+def open_generate_qns(client,scorer,topics,document_dict,max_workers,gen_kwargs,tokenizer,model_name,question_path=None,test_path=None,test_size=1000,qn_per_topic=1,use_tgi=True,ds_config=None):
     is_instruct_tuned = if_instruction_tuned(model_name)
     max_document_length = 2000
     r_scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=False)
@@ -28,15 +28,15 @@ def open_generate_qns(client,scorer,topics,document_dict,max_workers,gen_kwargs,
     def tgi_generate(prompt,prompt_type = 'topic'):
         return client.text_generation(prompt, **gen_kwargs[prompt_type])
     
-    def generate_qns_prompt(topic,docu_dict):
+    def generate_qns_prompt(topic,docu_dict,test_generation=False):
         document = docu_dict[topic]
         if len(tokenizer.encode(document,add_special_tokens=False)) > max_document_length:
             document = tokenizer.decode(tokenizer.encode(document,add_special_tokens=False)[:max_document_length])
         qn_prompt = format_question_w_document(topic,document)
-        if is_instruct_tuned:
+        if is_instruct_tuned or test_generation:
             qn_prompt = [{'role':'user','content':qn_prompt}]
-            qn_prompt = format_response(qn_prompt,model_name,tokenizer,mode='question')
-
+            if not test_generation:
+                qn_prompt = format_response(qn_prompt,model_name,tokenizer,mode='question')
         return {'topic':topic,'instruction':qn_prompt,'document':document}
     
     def generate_ans(qns_dicts):
@@ -76,12 +76,17 @@ def open_generate_qns(client,scorer,topics,document_dict,max_workers,gen_kwargs,
     def get_scored_ds(ans_dict):
         all_qn_confidences = []
         for ans_d in tqdm(ans_dict,total = len(ans_dict),desc=f'Scoring questions based on {scorer.scoring_method}'):
-            ref_ans = ans_d['ref_answer']
-            sample_ans = ans_d['sample_answer']
-            instruction = ans_d['instruction']
-            score_dict = scorer.get_score(instruction,ref_ans,sample_ans)
-            score_dict = {**ans_d,**score_dict}
-            all_qn_confidences.append(score_dict)
+            try:
+                ref_ans = ans_d['ref_answer']
+                sample_ans = ans_d['sample_answer']
+                instruction = ans_d['instruction']
+                score_dict = scorer.get_score(instruction,ref_ans,sample_ans)
+                if score_dict == None:
+                    continue
+                score_dict = {**ans_d,**score_dict}
+                all_qn_confidences.append(score_dict)
+            except Exception as e:
+                print (e)
         return all_qn_confidences
     
     if not os.path.exists(question_path):
@@ -90,11 +95,10 @@ def open_generate_qns(client,scorer,topics,document_dict,max_workers,gen_kwargs,
             dict_keys['input'] = 'instruction'
             dict_keys['output'] = 'instruction'
         qns_dict = HF_generate(qns_prompts,client,tokenizer,gen_kwargs['questions'],use_tgi=use_tgi,max_workers=max_workers,dict_keys=dict_keys,msg = 'Generating questions')
-        
         # Check for duplicates.# 
         if qn_per_topic > 1:
             non_duplicate_qns = []
-            for q in qns_dict:
+            for q in tqdm(qns_dict,total = len(qns_dict),desc = 'Removing duplicates'):
                 n_instructions = q['instruction']
                 if use_tgi:
                     n_instructions = [n_instructions.generated_text] + [qq.generated_text for qq in n_instructions.details.best_of_sequences]
@@ -105,7 +109,7 @@ def open_generate_qns(client,scorer,topics,document_dict,max_workers,gen_kwargs,
                 # check with the rest of the instruction for duplicates
                 checking_instr = [n_instructions[0]]
                 for remaining_instr in n_instructions[1:]:
-                    if not is_duplicate(r_scorer,remaining_instr,checking_instr,max_rouge=0.5):
+                    if not is_duplicate(r_scorer,remaining_instr,checking_instr,max_rouge=0.7):
                         non_duplicate_qns.append({'topic':q['topic'],'document':q['document'],'instruction':remaining_instr})
                         checking_instr.append(remaining_instr)
                         
@@ -114,40 +118,13 @@ def open_generate_qns(client,scorer,topics,document_dict,max_workers,gen_kwargs,
             if use_tgi:
                 q['instruction'] = q['instruction'].generated_text
             non_duplicate_qns = qns_dict
-        
-        ## Take qn from test_size topics to reserve as test set
-        if not os.path.exists(test_path): # save heldout test qns
-            test_set = []
-            train_set = []
-            topic_qn_count = defaultdict(int)
-            for qn_d in non_duplicate_qns:
-                topic_qn_count[qn_d['topic']] +=1
-            unique_topics = [k for k,v in topic_qn_count.items() if v > 1] # we only consider the topics with more than 1 qn so we can take 1 for test set
-            unique_topics = set(unique_topics[:test_size])
-
-            for qn_d in non_duplicate_qns:
-                if len(unique_topics) > 0:
-                    if qn_d['topic'] in unique_topics:
-                        test_set.append(qn_d)
-                        unique_topics.remove(qn_d['topic'])
-                    else:
-                        train_set.append(qn_d)
-                else:
-                    train_set.append(qn_d)
-                    
-            with open(test_path,'w') as f:
-                for instance in test_set:
-                    json.dump(instance,f,ensure_ascii=False)
-                    f.write('\n')
-        else:
-            train_set = non_duplicate_qns
 
         if use_tgi:
-            ans_dict = async_process(generate_ans,train_set,max_workers,msg = 'Generating answers')
+            ans_dict = async_process(generate_ans,non_duplicate_qns,max_workers,msg = 'Generating answers')
         else:
             ans_dict = []
-            for batch_i in tqdm(range(0,len(train_set),max_workers),total = len(train_set)//max_workers,desc='Generating answers'):
-                batch = train_set[batch_i:batch_i+max_workers]
+            for batch_i in tqdm(range(0,len(non_duplicate_qns),max_workers),total = len(non_duplicate_qns)//max_workers,desc='Generating answers'):
+                batch = non_duplicate_qns[batch_i:batch_i+max_workers]
                 ans_batch = generate_ans(batch)
                 ans_dict.extend(ans_batch)
         with open(question_path,'wb') as f:
@@ -156,6 +133,34 @@ def open_generate_qns(client,scorer,topics,document_dict,max_workers,gen_kwargs,
         with open(question_path,'rb') as f:
             ans_dict = pickle.load(f)
 
+    # Generate test questions using a separate LLM - GPT3.5-instruct
+    if not os.path.exists(test_path):
+        unique_topics = set([t['topic'] for t in ans_dict])
+        existing_topic_questions = defaultdict(list)
+        for t in ans_dict:
+            existing_topic_questions[t['topic']].append(t['instruction'])
+        test_topics = list(unique_topics)[:test_size] # assume that test size is at most num topics
+        document_ds = get_wiki(-1,ds_config,get_ds=True)
+        document_dict = {d['title']:d['text'] for d in document_ds if d['title'] in test_topics}
+        test_qn_prompts = [generate_qns_prompt(topic,document_dict,test_generation=True) for topic in test_topics]
+        test_ds = []
+        for tp in tqdm(test_qn_prompts,total = len(test_qn_prompts),desc = 'Generating test questions'):
+            num_tries = 0
+            while num_tries < 5:
+                test_qn = openai_call('gpt-3.5-turbo-instruct',tp['instruction'],max_tokens=gen_kwargs['questions']['max_new_tokens'],temperature=gen_kwargs['questions']['temperature'])
+                if test_qn is None:
+                    break
+                if not is_duplicate(r_scorer,test_qn,existing_topic_questions[tp['topic']],max_rouge=0.5):
+                    break
+                else:
+                    num_tries += 1
+            if test_qn is not None:
+                test_ds.append({'topic':tp['topic'],'document':tp['document'],'instruction':test_qn})
+        
+        with open(test_path,'w') as f:
+            for instance in test_ds:
+                json.dump(instance,f,ensure_ascii=False)
+                f.write('\n')
     if score_key not in ans_dict[0]: # not yet scored.
         all_qn_confidences = get_scored_ds(ans_dict)
         with open(question_path,'wb') as f: # re-update the question_set with other approach scores.
@@ -185,14 +190,14 @@ def main():
     parser.add_argument("--use_tgi", action='store_true',help = 'use TGI for loaded model to do eval')
     parser.add_argument("--max_response_tokens", type=int, default=256,help = 'max tokens for answer generation')
     parser.add_argument("--num_topics",  type = int,default = 200,help = 'total qns to generate')
-    parser.add_argument("--num_concurrent_calls", type=int, default=32,help = 'max_api_calls to TGI at a time')
+    parser.add_argument("--num_concurrent_calls", type=int, default=64,help = 'max_api_calls to TGI at a time')
     parser.add_argument("--num_samples", type=int, default=5,help = 'number of sampled responses')
     parser.add_argument("--filter_size",  type = float,default = 1.0,help = 'Top questions to take based on confidence/uncertainty')
     parser.add_argument("--questions_per_topic",  type = int,default = 10)
     parser.add_argument("--test_size",  type = int,default = 500)
     parser.add_argument("--beta",  type = float,default = 1.0,help = 'Trade-off between observed and self-reflected confidence, for BSDetector only.')
     parser.add_argument("--answer_generator_port", type=int, default=8083,help = 'port for TGI to generate answer, only used for mistral_8x7 if loaded locally.')
-    parser.add_argument("--openai_api_key_path",  type = str,default = '',help = 'a text file for openai api key, required only if using factscorer.')
+    parser.add_argument("--openai_api_key_path",  type = str,default = 'openai_api_key.txt',help = 'a text file for openai api key, required only if using factscorer.')
     args = parser.parse_args()
     
     ## Seed ## 
@@ -203,12 +208,6 @@ def main():
     ## Get config ##
     with open(args.config_path,'r') as f:
         config = SimpleNamespace(**yaml.safe_load(f))
-        
-    if args.answer_generator in ['gpt4,gpt3.5']:
-        assert args.openai_api_key_path != '','Need to provide openai api key for gpt4/gpt3.5'
-        with open(args.openai_api_key_path,'r') as f:
-            openai_api_key = f.read
-        os.environ['OPENAI_API_KEY'] = openai_api_key
     
     ds_name = 'wiki'
     ds_config_path = f'configs/data/{ds_name}.yaml'
@@ -225,8 +224,14 @@ def main():
                                                                  answer_generator=args.answer_generator,
                                                                 scoring_name=scoring_name)
     ds_config['test_dataset_path'] = ds_config['test_dataset_path'].format(dataset_name = ds_name)
-    if not os.path.exists(ds_config['test_dataset_path']):
-        assert args.questions_per_topic >1, 'need more 1 qn per topic, to reserve test set.'
+
+    if args.answer_generator in ['gpt4,gpt3.5'] or not os.path.exists(ds_config['test_dataset_path']):
+        assert args.openai_api_key_path != '','Need to provide openai api key for gpt4/gpt3.5'
+        with open(args.openai_api_key_path,'r') as f:
+            openai_api_key = f.read()
+        if openai_api_key == '':
+            raise ValueError('Need to provide openai api key for gpt4/gpt3.5')
+        os.environ['OPENAI_API_KEY'] = openai_api_key
     
     ## Question path ##
     config.question_path = config.question_path.format(topic_generator=args.topic_generator)
@@ -272,12 +277,13 @@ def main():
                                              test_path = ds_config['test_dataset_path'],
                                              test_size = args.test_size,
                                              qn_per_topic = args.questions_per_topic,
-                                             use_tgi=args.use_tgi)
+                                             use_tgi=args.use_tgi,
+                                             ds_config=ds_config)
 
     with open(config.train_dataset_path,'w') as f:
-            for instance in train_unknown_qns:
-                json.dump(instance,f,ensure_ascii=False)
-                f.write('\n')
+        for instance in train_unknown_qns:
+            json.dump(instance,f,ensure_ascii=False)
+            f.write('\n')
 
 if __name__ == "__main__":
     main()

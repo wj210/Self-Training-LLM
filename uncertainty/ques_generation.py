@@ -84,15 +84,17 @@ def open_generate_qns(client,scorer,num_iterations,max_workers,gen_kwargs,tokeni
             formatted_ans_prompt = "\n\n".join(few_shot + [f"Q: {qns}\nA: "])
         ref_ans = tgi_generate(formatted_ans_prompt,'ref_answer')
         sample_answer = tgi_generate(formatted_ans_prompt,'sample_answers')
-        sample_text = [sample_answer.generated_text] + [s.generated_text for s in sample_answer.details.best_of_sequences]
-        ref_text = ref_ans.generated_text
-        out = {'ref_ans':ref_text,'sample_ans':sample_text,'instruction':qns,'topic':topic}
+        
+        out = {'ref_answer':ref_ans,'sample_ans':sample_answer,'instruction':qns,'topic':topic}
         return out 
     
     def get_scored_ds(ans_dict):
         all_qn_confidences = []
         for ans_d in tqdm(ans_dict,total = len(ans_dict),desc=f'Scoring questions based on {scorer.scoring_method}'):
-            ref_ans = ans_d['ref_answer']
+            if 'ref_ans' in ans_d:
+                ref_ans  = ans_d['ref_ans']
+            else:
+                ref_ans = ans_d['ref_answer']
             sample_ans = ans_d['sample_ans']
             instruction = ans_d['instruction']
             score_dict = scorer.get_score(instruction,ref_ans,sample_ans)
@@ -156,30 +158,35 @@ def open_generate_qns(client,scorer,num_iterations,max_workers,gen_kwargs,tokeni
                 pickle.dump(ans_dict,f)
         else:
             ans_dict = final_qns_dict
-    else:
-        if scorer.answer_generator != 'oracle_answer':
-            with open(question_path,'rb') as f:
-                ans_dict = pickle.load(f)
             
-            if score_key not in ans_dict[0]: # not yet scored.
-                ans_dict = get_scored_ds(ans_dict)
-                with open(question_path,'wb') as f: # re-update the question_set with other approach scores.
-                    pickle.dump(ans_dict,f)
+    if scorer.answer_generator != 'oracle_answer':
+        with open(question_path,'rb') as f:
+            ans_dict = pickle.load(f)
         
-            unknown_qns = return_question_type(ans_dict,scorer.scoring_method) 
-            ## Get DPO dataset , get chosen answer based on google search, LLM generator or heuristics (confidence/entropy) ##
-            get_ds_fn = partial(scorer.get_dpo_sample,few_shots=few_shots)
-            generated_ds = []
-            for unknwn_qn in tqdm(unknown_qns,desc='Generating dpo samples',total = len(unknown_qns)):
-                try:
-                    generated_ds.append(get_ds_fn(unknwn_qn))
-                except Exception as e:
-                    print (e)
-            generated_ds = [t for t in generated_ds if t is not None]
-        else:
-            generated_ds = ans_dict
-            for g in generated_ds: # replace key
-                g['chosen_ans'] = g.pop('actual_label')
+        if score_key not in ans_dict[0]: # not yet scored.
+            ans_dict = get_scored_ds(ans_dict)
+            with open(question_path,'wb') as f: # re-update the question_set with other approach scores.
+                pickle.dump(ans_dict,f)
+    
+        # unknown_qns = return_question_type(ans_dict,scorer.scoring_method) ## TEMP
+        unknown_qns = ans_dict
+        ## Get DPO dataset , get chosen answer based on google search, LLM generator or heuristics (confidence/entropy) ##
+        get_ds_fn = partial(scorer.get_dpo_sample,few_shots=few_shots)
+        generated_ds = []
+        for unknwn_qn in tqdm(unknown_qns,desc='Generating dpo samples',total = len(unknown_qns)):
+            try:
+                generated_ds.append(get_ds_fn(unknwn_qn))
+            except Exception as e:
+                print (e)
+        generated_ds = [t for t in generated_ds if t is not None]
+    else:
+        generated_ds = ans_dict
+        for g in generated_ds: # replace key
+            g['chosen_ans'] = g.pop('answer')
+            g['rejected_ans'] = random.choice(g['incorrect_answer'])
+        # else:
+        #     for g in generated_ds: # replace key
+        #         g['chosen_ans'] = g.pop('actual_label')
     return generated_ds
 
 def main():
@@ -354,9 +361,10 @@ def main():
         prev_topics = get_fixed_topics(ds_name)
         test_ds,fs_shot_generation,defined_ds = get_fixed_ds(ds_config,args.questions_per_topic,args.test_question_per_topic,args.topic_generator)
         exclude_instructions = deepcopy(test_ds)
+        defined_ds = [vars(d) for d in defined_ds]
         if 'fixed' in config.topic_generator:
             defined_ds = None # we dont need this for fixed ds since question is self-generated.
-        
+            
         if 'truthful_qa' in config.topic_generator:
             qn_generation_kwargs['answer_few_shot'] = [SimpleNamespace(**d) for d in ds_config['test_few_shot']]
             qn_generation_kwargs['single_qn'] = True
