@@ -19,7 +19,7 @@ def main():
     parser.add_argument("--training_batch_size",  type = int,default = 4)
     parser.add_argument("--filter_size",  type = float,default = 1.0,help = 'Top questions to take based on confidence/uncertainty')
     parser.add_argument("--peft_path",  type = str,default = 'configs/training/lora.yaml',help = 'get lora parameters')
-    parser.add_argument("--training_args_path",  type = str,default = 'configs/training/dpo_trainer.yaml',help = 'get lora parameters')
+    parser.add_argument("--training_args_path",  type = str,default = 'configs/training/dpo_trainer.yaml',help = 'get train params, default DPO')
     parser.add_argument("--use_peft",  type = bool,default = False,help = 'use peft')
     args = parser.parse_args()
     

@@ -28,7 +28,6 @@ def main():
     parser.add_argument("--test_batch_size",  type = int,default = 4)
     parser.add_argument("--quantized",  type = bool,default = False,help = 'quantized model for inference')
     parser.add_argument("--trained",  type = bool,default = False,help = 'if trained, load model path else model_name')
-    parser.add_argument("--test_question_per_topic",  type = int,default =-1,help = 'if more than -1, we only test on this number of questions per topic')
     parser.add_argument("--num_samples", type=int, default=5,help = 'number of sampled responses')
     parser.add_argument("--extra_ds",  type = str,default =[],nargs = '+',help = 'test on datasets that are not trained on.')
     parser.add_argument("--filter_size",  type = float,default = 1.0,help = 'Top questions to take based on confidence/uncertainty')
@@ -60,11 +59,6 @@ def main():
         scoring_name = 'entropy'
     else:
         scoring_name = 'hallu'
-    model_dir = 'model_checkpoints'
-    if not args.use_peft:
-        model_dir += '_full'
-        config.model_path = config.model_path.replace('model_checkpoints','model_checkpoints_full')
-    
     ## Model path ##
     config.model_path = config.model_path.format(topic_generator=args.topic_generator,
                                                 answer_generator=args.answer_generator,
@@ -76,6 +70,9 @@ def main():
                                                 answer_generator=args.answer_generator,
                                                 scoring_name=scoring_name,
                                                 filter_size = int(100*args.filter_size))
+    if not args.use_peft:
+        config.model_path = config.model_path.replace('model_checkpoints','model_checkpoints_full')
+        config.result_path = config.result_path.split('txt')[0] + '_full.txt'
     
     ## Question path ## (to do testing on known dataset for catastrophic forgetting)
     # config.question_path = config.question_path.format(topic_generator=args.topic_generator)
@@ -101,8 +98,7 @@ def main():
     
     ## Main Test dataset path ## (ignore for halueval)
     if ds_name not in ['truthful_qa_mc','halueval']:
-        ds_config['test_dataset_path'] = ds_config['test_dataset_path'].format(dataset_name = ds_name,
-                                                                test_qn_per_topic=args.test_question_per_topic)
+        ds_config['test_dataset_path'] = ds_config['test_dataset_path'].format(dataset_name = ds_name)
         with open(ds_config['test_dataset_path'],'r') as f: 
             test_dataset = [json.loads(line) for line in f]
     else:
@@ -185,7 +181,7 @@ def main():
     ## Conduct testing for each ds ## 
     logged_results = {}
     for test_ds_name,ds_dict in all_testing_dict.items():
-        if (args.use_tgi and ds_dict['ds_type'] == 'generation'): # Load model according to the type of dataset.
+        if args.use_tgi and ds_dict['ds_type'] == 'generation': # Load model according to the type of dataset.
             model = InferenceClient(model = f"http://127.0.0.1:{args.port}")
         else:
             model = load_hf_model(test_load_path,quantized=args.quantized).eval() 

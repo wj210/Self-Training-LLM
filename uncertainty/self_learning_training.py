@@ -58,8 +58,8 @@ def list_to_hf_ds(ds,model_name,tokenizer,test=False,mode ='dpo'):
         if mode == 'dpo':
             return HFDataset.from_dict({
                 'prompt': [prompt_msg_fn(x['instruction']) for x in ds],
-                'chosen': [x['chosen_ans'] for x in ds],
-                'rejected': [x['rejected_ans'] for x in ds]
+                'chosen': [x['chosen_ans'] + "</s>" for x in ds],
+                'rejected': [x['rejected_ans'] + "</s>" for x in ds]
             })
         elif mode == 'sft':
             # message = [format_response([{'role':'user','content':x['instruction']},
@@ -180,6 +180,7 @@ def do_train(
         model_ref = None
         ref_model_kwargs = None
         training_args.learning_rate = peft_config_dict['learning_rate'] # peft uses higher learning rate
+        training_args.optim = peft_config_dict['optim']
         
     else:
         peft_config = None
