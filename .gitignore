@@ -8,7 +8,11 @@ scripts
 openai_api_key.txt
 uncertainty/test_code.py
 uncertainty/create_catastrophic_ds.py
+uncertainty/wiki_generation_old.py
 roberta_stopwords.txt
 .cache
+lm-evaluation-harness
+results
+log_results
 
 

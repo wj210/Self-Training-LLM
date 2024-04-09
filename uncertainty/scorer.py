@@ -4,7 +4,7 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer,pipel
 from torch.nn.utils.rnn import pad_sequence
 import concurrent.futures
 from copy import deepcopy
-from utils import HF_generate,extract_str_in_bracket,clean_answer,if_instruction_tuned,format_response,format_fs_qa,openai_call
+from utils import *
 from templates import self_reflection_prompt,self_answer_prompt
 from collections import defaultdict
 from functools import partial
@@ -125,12 +125,14 @@ class NLIScorer:
             ref_text = ref_answer['text']
         if ref_text.strip() == '':
             return None
-        all_answers = [ref_text]+ sample_text
+        
         # Clean the answers if not instruct tuned.
         if not if_instruction_tuned(self.gen_model_name):
-            sample_text = [clean_answer(x) for x in sample_text]
-            ref_text = clean_answer(ref_text)
-        
+            sample_text = [clean_non_instructed_answer(x) for x in sample_text]
+            ref_text = clean_non_instructed_answer(ref_text)
+            
+        all_answers = [ref_text]+ sample_text
+
         if self.scoring_method == 'BSDetector':
             """
             From the paper: QUANTIFYING UNCERTAINTY IN ANSWERS FROM ANY LANGUAGE MODEL AND ENHANCING THEIR TRUSTWORTHINESS
@@ -141,12 +143,9 @@ class NLIScorer:
             """
             ## Get Consistency score O ##
             nli_batch = [(ref_text,a) for a in sample_text]
-            if self.ref_as_chosen:
-                nli_scores =  self.get_nli_score(nli_batch,return_full_score=True) # we want the contradict scores as well.
-                o = nli_scores[:,0].mean().item()
-            else:
-                o = self.get_nli_score(nli_batch).mean().item()
-                nli_scores = None
+            nli_scores =  self.get_nli_score(nli_batch,return_full_score=True) # we want the contradict scores as well.
+            o = nli_scores[:,0].mean().item()
+
             ## Get self-reflection certainty score S ##
             if self.beta < 1: # if beta is 1, then we dont need to calculate self-reflection score
                 if if_instruction_tuned(self.gen_model_name):
@@ -176,8 +175,9 @@ class NLIScorer:
                 reflect_scores = [0. for _ in range(len(all_answers))]
             
             overall_confidence =  (self.beta * o) + ((1 - self.beta) * s) # confidence for response to question x
-            
+
             return {'confidence':overall_confidence,'instruction':instruction,'ref_answer':ref_text,'sample_answer':sample_text,'self_reflect_score':reflect_scores,'consistency_score':o,'all_nli_scores':nli_scores}
+
         
         elif self.scoring_method == 'semantic_consistency':
             """
@@ -189,7 +189,7 @@ class NLIScorer:
             Clusters with lowest entropy can be used as chosen answer where a random answer within the cluster is chosen, and clusters with highest entropy can be used as rejected answer
             Overall entropy is used as uncertainty score.
             """
-            main_answer = [ref_answer,sample_answer] # because main_answer tokens stored differently then the rest
+            main_answer = [ref_answer,sample_answer,rejected_answer] # because main_answer tokens stored differently then the rest
             if self.use_tgi:
                 ## Setup text to logprob dict ##
                 text_2_logprob = defaultdict()
@@ -214,10 +214,11 @@ class NLIScorer:
             hallu_score = all_hallu_scores.mean().item()
             
             return {'hallucination':hallu_score,'instruction':instruction,'ref_answer':ref_text,'sample_answer':sample_text,'all_hallu_scores':all_hallu_scores}
+
     
-    def get_dpo_sample(self,content_dict,few_shots=None): # use confidence/uncertainty measures to score responses
+    def get_dpo_sample(self,content_dict,fs_messages=None): # use confidence/uncertainty measures to score responses
         """
-        few_shots only available if fixed_ds is used, aka reference dataset is available, in here, only used for API, self is generated out of this fn.
+        fs_messages only for Stronger LLM usage
         Output dict should consist of 
         1) prompt, chosen and rejected answer for DPO training
         2) question confidence/uncertainty score to assess the model's confidence/uncertainty in self-generated questions
@@ -228,7 +229,6 @@ class NLIScorer:
         instruction = content_dict['instruction']
         topic = content_dict['topic']
         ref_answer = content_dict['ref_answer']
-        num_sample = len(sample_answers)
 
         # Between different scoring types, first pick worst answer, if self-generate best answer, pick it via the heuristics, else use oracle/gpt
         if self.scoring_method == 'BSDetector': # Each sampled answer act as reference, pick best and worse instead of always picking the ref answer
@@ -246,11 +246,9 @@ class NLIScorer:
             else: # we compare contradict scores against ref answer to choose the worse answer. chosen is ref.
                 all_ans_confidence = []
                 all_answers = sample_answers
-                if 'all_nli_scores' not in  content_dict:
-                    content_dict['all_nli_scores'] = self.get_nli_score([ref_answer + ' [SEP] ' + a for a in sample_answers],return_full_score=True)
                 contrad_scores = content_dict['all_nli_scores'][:,1].tolist()
                 all_ans_confidence = [(self.beta * (1.0-contra)) + ((1 - self.beta) * curr_r) for contra,curr_r in zip(contrad_scores,remaining_reflect_scores)] # take 1-contra to convert to positive to check for min.
-                
+            
             max_confidence_id = np.argmax(all_ans_confidence)
             min_confidence_id = np.argmin(all_ans_confidence) 
             rejected_ans = all_answers[min_confidence_id]
@@ -258,18 +256,20 @@ class NLIScorer:
             question_score = 1.0 - content_dict['confidence'] # take the inverse of confidence
 
         elif self.scoring_method == 'semantic_consistency':
-            semantic_clusters = content_dict['semantic_clusters'] # id to list of responses
-            all_cluster_entropies = content_dict['all_cluster_entropies'] # id to entropy
-            if self.ref_as_chosen: # if reference picked as chosen, remove the cluster that contains ref ans (since that is the chosen) and sample from rest.
-                assert len(list(all_cluster_entropies.keys())) > 1, 'Only 1 cluster found, cannot sample'
-                for cluster_id,cluster in semantic_clusters.items():
-                    if ref_answer in cluster:
-                        del semantic_clusters[cluster_id]
-                        del all_cluster_entropies[cluster_id]
-                        break
-            sorted_cluster_entropies = {k:v for k,v in sorted(all_cluster_entropies.items(),key=lambda x:x[1])}
-            rejected_ans = random.choice(semantic_clusters[list(sorted_cluster_entropies.keys())[-1]]) # highest entropy as rejected.
-            chosen_ans = random.choice(semantic_clusters[list(sorted_cluster_entropies.keys())[0]]) # lowest entropy as chosen
+            if not self.ref_as_chosen:
+                semantic_clusters = content_dict['semantic_clusters'] # id to list of responses
+                all_cluster_entropies = content_dict['all_cluster_entropies'] # id to entropy
+                if self.ref_as_chosen: # if reference picked as chosen, remove the cluster that contains ref ans (since that is the chosen) and sample from rest.
+                    assert len(list(all_cluster_entropies.keys())) > 1, 'Only 1 cluster found, cannot sample'
+                    for cluster_id,cluster in semantic_clusters.items():
+                        if ref_answer in cluster:
+                            del semantic_clusters[cluster_id]
+                            del all_cluster_entropies[cluster_id]
+                            break
+                sorted_cluster_entropies = {k:v for k,v in sorted(all_cluster_entropies.items(),key=lambda x:x[1])}
+                rejected_ans = random.choice(semantic_clusters[list(sorted_cluster_entropies.keys())[-1]]) # highest entropy as rejected.
+                chosen_ans = random.choice(semantic_clusters[list(sorted_cluster_entropies.keys())[0]]) # lowest entropy as chosen
+                
             question_score = content_dict['entropy']
         
         elif self.scoring_method == 'SelfCheckGPT': ## Very similar to BSDetector but without self-reflect.
@@ -284,7 +284,7 @@ class NLIScorer:
             else:
                 all_answers = sample_answers
                 all_hallu_scores = content_dict['all_hallu_scores']
-
+            
             max_hallu_id = np.argmax(all_hallu_scores)
             min_hallu_id = np.argmin(all_hallu_scores)
             chosen_ans = all_answers[min_hallu_id]
@@ -293,13 +293,6 @@ class NLIScorer:
             
         else:
             raise ValueError('Invalid scoring method')
-        
-        ## Few shot only used for external LLM such as GPT3.5/4 or Mistral_MOE
-        if few_shots is not None:
-            few_shots = few_shots[topic]
-            fs_messages = format_fs_qa(few_shots,True)
-        else:
-            fs_messages = []
         
         if self.ref_as_chosen and 'self' in self.answer_generator: # force chosen ans as reference answer
             chosen_ans = ref_answer

@@ -18,3 +18,6 @@ torchvision==2.0.2+cu117
 transformers==4.36.2
 trl==0.7.11
 peft==0.8.2
+sentence_transformers==2.3.1
+rouge_score==0.1.2
+scipy==1.12.0

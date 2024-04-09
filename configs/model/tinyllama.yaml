@@ -1,9 +1,7 @@
-# model_name: TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T
 model_name: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 train_dataset_path: data/{topic_generator}/train/tinyllama_{scoring_name}_{answer_generator}.jsonl
 fs_path: data/{dataset_name}/fs_shot.pkl
 question_path: data/{topic_generator}/questions/tinyllama.pkl
 model_path: model_checkpoints/{topic_generator}/tinyllama_{scoring_name}_{answer_generator}_top{filter_size}
 result_path: test_results/{topic_generator}/tinyllama_{scoring_name}_{answer_generator}_top{filter_size}.txt
-catastrophic_ds_path: data/catastrophic_ds/tinyllama_{ds_name}.jsonl
-learning_rate: 2.0e-4
+learning_rate: 5.0e-6

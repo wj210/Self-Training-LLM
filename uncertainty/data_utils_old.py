@@ -17,7 +17,6 @@ from factscore.factscorer import FactScorer
 import os
 import json
 from utils import SCORE_KEY
-import pickle
 
 
 @dataclass
@@ -74,6 +73,9 @@ def is_duplicate(scorer,h,r_list,max_rouge=0.7):
 def chunk_document(document,tokenizer,sentence_processor,max_length,max_batches=7):
     sentences = [s.text.strip() for s in sentence_processor(document).sents]
     lengths = [len(tokenizer.encode(s)) for s in sentences]
+    total_length = sum(lengths)
+    if total_length > (max_batches*max_length)*1.5: # if document is very long, we allow longer context.
+        max_length *= 2 
     ## Arrange it into list of joined sentences such that each have at most max_length tokens in the fastest way
     list_of_chunks = []
     current_chunk = []
@@ -93,13 +95,14 @@ def chunk_document(document,tokenizer,sentence_processor,max_length,max_batches=
     list_of_chunks.append(" ".join(current_chunk))
     if len(list_of_chunks) == 1 and list_of_chunks[0] == "": # if somehow the document fail to be split and is too big.
         return [],None
-    if current_length < 512: # if last chunk is too short, remove it
+    if current_length < 200: # if last chunk is too short, remove it
         list_of_chunks = list_of_chunks[:-1]
-    # if len(list_of_chunks) > max_batches:
-    #     leftover_chunk =  random.choice(list_of_chunks[max_batches:])
-    # else:
-    #     leftover_chunk = None
-    return list_of_chunks[:max_batches]
+    random.shuffle(list_of_chunks)
+    if len(list_of_chunks) > max_batches:
+        leftover_chunk =  random.choice(list_of_chunks[max_batches:])
+    else:
+        leftover_chunk = None
+    return list_of_chunks[:max_batches],leftover_chunk
         
 
 def categorise_test_sample(ds_name,sample,type='generation'):
@@ -127,32 +130,31 @@ def categorise_test_sample(ds_name,sample,type='generation'):
     else:
         raise ValueError(f'Unsupported dataset {ds_name} for categorisation.')
 
-def load_test_ds(config,test_path='',max_test_samples=100):
+def load_test_ds(config,test_path=''):
     ds_name = config['ds_name']
     num_fs = config['test_few_shot']
     if test_path != '':
         with open(test_path,'r') as f:
-            test_ds = [json.loads(l) for l in f.readlines()][:max_test_samples]
+            test_ds = [json.loads(l) for l in f.readlines()]
         out_fs = []
         return test_ds,out_fs
     if 'mmlu' in ds_name: # get fs from each topic
         ds = load_dataset(ds_name,config['subset'],split = config['test_split'])
-        # val_ds = load_dataset(ds_name,config['subset'],split = 'validation').shuffle(seed=42).select(range(num_fs))
+        val_ds = load_dataset(ds_name,config['subset'],split = 'validation').shuffle(seed=42).select(range(num_fs))
         out_fs = []
         test_ds = []
         for d in ds:
             test_ds.append(vars(categorise_test_sample(ds_name,d)))
-        # for vd in val_ds:
-        #     out_fs.append(vars(categorise_test_sample(ds_name,vd)))
+        for vd in val_ds:
+            out_fs.append(vars(categorise_test_sample(ds_name,vd)))
     elif 'truthful_qa' in ds_name:
         ds = load_dataset(ds_name,config['subset'],split = config['test_split'])
         test_ds = [vars(categorise_test_sample(ds_name,d,type=config['subset'])) for d in ds]
         if config['subset'] =='generation':
             out_fs = num_fs # fs is already defined file.
         else:
-            out_fs = []
-            for d in test_ds:
-                d['instruction'] = num_fs + '\n\nQ: ' + d['instruction'] + '\nA:'
+            out_fs = test_ds[:num_fs] # fs is the first num_fs samples for multiple_choice
+            test_ds = test_ds[num_fs:]
     elif 'wiki' in ds_name:
         ds_path = 'data/wiki/test.jsonl'
         with open(ds_path,'r') as f:
@@ -169,15 +171,14 @@ def load_test_ds(config,test_path='',max_test_samples=100):
         for d in test_ds:
             if random.random() > 0.5:
                 chosen_answer = d["hallucinated_answer"]
-                answer = 0
+                answer = 'Yes'
             else:
                 chosen_answer = d['right_answer']
-                answer = 1
+                answer = 'No'
             question = prefix + "\n\n#Question#: " + d['question'] +"\n#Answer#: " + chosen_answer + "\n#Your Judgement#: "
             new_d.append({'instruction':question,
                           'answer':answer,
                           'system_prompt':"You are a huallucination detector. You MUST determine if the provided answer contains hallucination or not for the question based on the world knowledge. The answer you provided MUST be Yes or No",
-                          'choices':['Yes','No'],
                           'topic':'qa'})
         test_ds = new_d
         out_fs = []
@@ -222,25 +223,6 @@ def load_train_ds(ds_name,tokenizer):
         
         train_ds = train_ds.map(map_fn,fn_kwargs={'tokenizer':tokenizer},remove_columns=column_names,num_proc=64,desc = 'applying chat template')
         val_ds = val_ds.map(map_fn,fn_kwargs={'tokenizer':tokenizer},remove_columns=column_names,num_proc=64,desc = 'applying chat template')
-        return {'train':train_ds,'val':val_ds}
-    elif ds_name == 'ultrafeedback':
-        ds = load_dataset("HuggingFaceH4/ultrafeedback_binarized")
-        total = 30000
-        train_ds = ds['train_prefs'].shuffle(seed=42).select(range(total))
-        val_ds  = ds['test_prefs']
-        def map_fn(ds):
-            out_ds = []
-            for d in ds:
-                instr = d['chosen'][0]['content']
-                chosen = d['chosen'][-1]['content']
-                rejected = d['rejected'][-1]['content'] 
-                out_d = {'instruction':instr,
-                          'chosen_ans':chosen,
-                          'rejected_ans':rejected}
-                out_ds.append(out_d)
-            return out_ds
-        train_ds = map_fn(train_ds)
-        val_ds = map_fn(val_ds)
         return {'train':train_ds,'val':val_ds}
     else:
         raise ValueError(f'Unsupported dataset {ds_name}')
@@ -366,12 +348,15 @@ def get_fixed_ds(config,question_per_topic,test_qn_per_topic,generator_type=''):
 
     return out_ds,fs_ds,defined_ds
 
-def get_wiki(num_topics,data_config,get_ds=False,num_test_topics=0,embedding_dict=None,topic2docu=None):
+def get_wiki(num_topics,data_config,get_ds=False):
+    ds = load_dataset(data_config['ds_name'], data_config['subset'],split='train', num_proc=16)
     if get_ds:
-        ds = load_dataset(data_config['ds_name'], data_config['subset'],split='train', num_proc=16)
         return ds
-    selected_topics,topic2docu,test_topics = get_top_articles(num_topics,topic2docu,num_test_topics,embedding_dict)
-    return selected_topics,topic2docu,test_topics
+    # sampled = ds.shuffle(seed=42).select(range(num_topics))
+    # topics = [d['title'] for d in sampled]
+    topic2docu = {d['title']:d['text'] for d in ds}
+    selected_topics,topic2docu = get_top_articles(num_topics,topic2docu)
+    return selected_topics,topic2docu
 
 class LikelihoodDS(torch.utils.data.Dataset):
     def __init__(self,ds,tokenizer,model_name,few_shots=None,kwargs=None):
@@ -381,24 +366,33 @@ class LikelihoodDS(torch.utils.data.Dataset):
         self.few_shots = few_shots
         self.trained = kwargs.get('trained',False)
         self.ds_name = kwargs.get('ds_name',None)
-        self.num2alpha = {i:chr(i+97).upper() for i in range(26)}
-        self.alpha2token = {chr(i+97).upper():self.tokenizer.encode(chr(i+97).upper(),add_special_tokens=False)[0] for i in range(26)}
+        if 'truthful_qa' in self.ds_name: # answer is always first choice, shuffle to prevent bias
+            self.few_shots = [self.shuffle_choices(fs) for fs in self.few_shots]
+        if self.ds_name != 'halueval':
+            self.num2alpha = {i:chr(i+97).upper() for i in range(26)}
+            self.alpha2token = {chr(i+97).upper():self.tokenizer.encode(chr(i+97).upper(),add_special_tokens=False)[0] for i in range(26)}
+        else:
+            self.yes_no_token = {'Yes':self.tokenizer.encode('Yes',add_special_tokens=False)[0],
+                                 'No':self.tokenizer.encode('No',add_special_tokens=False)[0]}
         self.setup()
     
     def setup(self):
         self.batched_ds = []
-        for sample_id,d in enumerate(self.ds): # d is QA_sample, we batch the choices up and then process before converting back according to id
+        for d in self.ds: # d is QA_sample, we batch the choices up and then process before converting back according to id
             if 'truthful_qa' in self.ds_name:
                 d = self.shuffle_choices(d)
             topic = d['topic']
-            choices = d['choices']
-            answer = d['answer'] # position of choices
+            if 'choices' in d:
+                possible_choices = [self.num2alpha[i] for i in range(len(d['choices']))] # [A,B,C ...]
+            else:
+                possible_choices = None
             test_prompt = self.format_instruction(d,add_answer=False)
+            
             if self.few_shots is not None and len(self.few_shots) > 0:
                 few_shots = self.setup_fewshot()
                 test_prompt = few_shots + test_prompt
             if self.trained or if_instruction_tuned(self.model_name):
-                formatted_instr = format_response(test_prompt,self.model_name,self.tokenizer,mode='empty')
+                formatted_instr = format_response(test_prompt,self.model_name,self.tokenizer,mode='answer')
             else:
                 formatted_instr = ''
                 for msg in test_prompt:
@@ -406,16 +400,13 @@ class LikelihoodDS(torch.utils.data.Dataset):
                         formatted_instr += msg['content']
                     elif msg['role'] == 'assistant':
                         formatted_instr += (msg['content'] + '\n\n')
-            for choice_id,choice in enumerate(choices):
-                choice_alpha = self.num2alpha[choice_id]
-                cont = f"{choice_alpha}: {choice}" if self.ds_name not in ['halueval','truthful_qa_mc'] else choice
-                joined_context = formatted_instr + cont
-                joined_tokenized = torch.tensor(self.tokenizer.encode(joined_context,add_special_tokens=False),dtype=torch.long)
-                cont_tokenized = torch.tensor(self.tokenizer.encode(cont,add_special_tokens=False),dtype=torch.long)
-                input_tokenized = joined_tokenized[:-cont_tokenized.shape[0]]
-                combined_tokenized = torch.cat([input_tokenized,cont_tokenized])[:-1] # remove last token
-                data_dict = {'instruction':combined_tokenized,'answer':answer,'topic':topic,'cont':cont_tokenized,'sample_id':sample_id,'choice_id':choice_id,'input_len':combined_tokenized.shape[0]}
-                self.batched_ds.append(data_dict)
+            if self.ds_name != 'halueval':
+                answer = self.num2alpha[d['answer']]
+            else:
+                answer = d['answer']
+            topic = d['topic']
+            data_dict = {'instruction':formatted_instr,'answer':answer,'topic':topic,'choices':possible_choices}
+            self.batched_ds.append(data_dict)
         return self.batched_ds
     
     def __len__(self):
@@ -426,43 +417,40 @@ class LikelihoodDS(torch.utils.data.Dataset):
     
     def collate_fn(self,batch):
         instr = [b['instruction'] for b in batch]
+        choices = [b['choices'] for b in batch]
         answer = [b['answer'] for b in batch]
         topics = [b['topic'] for b in batch]
-        sample_id = [b['sample_id'] for b in batch]
-        choice_id = [b['choice_id'] for b in batch]
-        cont = [b['cont'] for b in batch]
-        input_len = [b['input_len'] for b in batch]
-        tokenized_input = pad_sequence(instr,batch_first=True,padding_value=self.tokenizer.pad_token_id)
+        tokenized_input = self.tokenizer(instr,return_tensors='pt',padding='longest',truncation=False,add_special_tokens=False).input_ids
         out = {'input_ids':tokenized_input,
                 'answer':answer,
                 'topic':topics,
-                'sample_id':sample_id,
-                'choice_id':choice_id,
-                'cont':cont,
-                'input_len':input_len
+                'choices':choices
                 }
+        if 'data_sample' in batch[0]:
+            out['data_sample'] = [b['data_sample'] for b in batch]
+        
         return out
     
-    def derive_prediction(self,logits,batch,pred_dict,answer_dict):
-        logprobs = torch.nn.functional.log_softmax(logits,dim=-1)
-        answer = batch['answer']
-        sample_id = batch['sample_id']
-        choice_id = batch['choice_id']
-        input_len = batch['input_len']
-        conts = batch['cont']
-        for logprob,inp_len,cont,s_id,c_id,ans in zip(logprobs,input_len,conts,sample_id,choice_id,answer):
-            logprob = logprob[:inp_len]
-            cont_logprob = logprob[-cont.shape[0]:]
-            cont_logprob = torch.gather(cont_logprob,1,cont.unsqueeze(1)).squeeze(-1)
-            normalized_logprob = cont_logprob.sum().item()/cont_logprob.shape[0]
-            pred_dict[s_id][c_id] = normalized_logprob
-            if s_id not in answer_dict:
-                answer_dict[s_id] = ans
-        # return pred_dict,answer_dict
-        
-        
+    def derive_prediction(self,logits,choices,answer):
+        choice_probs = defaultdict()
+        probs = torch.nn.functional.softmax(logits,dim=0)
+        # get greedy option 
+        if self.ds_name != 'halueval':
+            for choice in choices: 
+                choice_probs[choice] = probs[self.alpha2token[choice]] 
+            greedy_choice = sorted(choice_probs.items(),key=lambda x:x[1],reverse=True)[0][0]
+            confidence_score = choice_probs[answer].detach().cpu().item()
+        else:
+            yes_no_probs = {}
+            for tok,tok_pos in self.yes_no_token.items():
+                yes_no_probs[tok] = probs[tok_pos]
+            greedy_choice = sorted(yes_no_probs.items(),key=lambda x:x[1],reverse=True)[0][0]
+            confidence_score = yes_no_probs[answer].detach().cpu().item()
+        acc_score = int(greedy_choice == answer)
+        return acc_score,confidence_score 
+    
     def format_instruction(self,sample,add_answer=False): # sample is a QA_sample
-        if self.ds_name not in ['halueval','truthful_qa_mc']:
+        if self.ds_name != 'halueval':
             instr = sample['instruction']
             choices = sample['choices']
             instr = QA_format(instr,choices)
@@ -472,7 +460,7 @@ class LikelihoodDS(torch.utils.data.Dataset):
         if add_answer:
             answer = self.num2alpha[sample['answer']]
             answer_choice = choices[sample['answer']]
-            msg += [{'role':'assistant','content':f'{answer}: {answer_choice}'}]
+            msg += [{'role':'assistant','content':' '+answer+ f': {answer_choice}'}]
         return msg
     
     def setup_fewshot(self):
@@ -517,10 +505,9 @@ class GenerationDS(torch.utils.data.Dataset):
             self.metric = None
         self.trained = kwargs.get('trained',False)
         self.scorer = scorer 
-        if 'wiki' in self.ds_name:
-            self.fs = kwargs['factscorer']
-            self.knowledge_source = kwargs['knowledge_source']
-            self.topic2docu  = kwargs['topic2docu']
+        # if self.ds_name == 'wiki':
+        #     self.fs = kwargs['factscorer']
+        #     self.knowledge_source = kwargs['knowledge_source']
         self.setup()
         
     def setup(self):
@@ -573,14 +560,14 @@ class GenerationDS(torch.utils.data.Dataset):
             scores_false = self.metric.compute(predictions=[pred]*len(incorrect),references=incorrect)['scores']
             return int(max(scores_true) > max(scores_false))
         elif 'wiki' in self.ds_name: 
-            fs_score = self.fs.get_score(topic,pred,
-                                         gamma=0,  # gamma is length penalty, remove it.
-                                         knowledge_source = self.knowledge_source,
-                                         verbose = True,
-                                         n = 5, # n is the number of examples to teach gpt to decompose facts.
-                                         batch_size = 16,
-                                         k=3) # k is the number of retrieved passages to support the text.
-            return fs_score
+            # fs_score = self.fs.get_score(topic,pred,
+            #                              gamma=0,  # gamma is length penalty, remove it.
+            #                              knowledge_source = self.knowledge_source,
+            #                              verbose = True,
+            #                              n = 2,
+            #                              batch_size = 8) # n is the number of examples to teach gpt to decompose facts.
+            # return fs_score
+            return -1
         elif 'cf' in self.ds_name:
             return -1
         else:

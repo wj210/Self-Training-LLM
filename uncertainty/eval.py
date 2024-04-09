@@ -4,11 +4,13 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from utils import format_response,get_extract_template,if_instruction_tuned,HF_generate
-from data_utils import LikelihoodDS,GenerationDS
 from collections import defaultdict
 from copy import deepcopy
 from time import time
-import json
+
+
+def defaultint():
+    return defaultdict(int)
 
 def compute_ece(predictions, n_bins=10):
     """
@@ -70,32 +72,22 @@ def eval_fixed_ds(ds,model,model_name,tokenizer,ds_name,batch_size,ds_type= 'lik
         sample_kwargs['best_of'] = num_samples
         sample_kwargs['details'] = True
         gen_kwargs['details'] = True
-        
+    
+    fs_logger = []
+    if ds_type == 'likelihood':
+        pred_dict = defaultdict(defaultint)
+        answer_dict = defaultdict(int)
+    
     ## Eval on subject dataset ## (full dataset)
-    for batch in tqdm(test_dl,total = len(test_dl),desc = f'Running eval on {ds_name}'):
+    for i,batch in tqdm(enumerate(test_dl),total = len(test_dl),desc = f'Running eval on {ds_name}'):
         input_ids = batch['input_ids']
         answer = batch['answer']
         topics = batch['topic']
         if ds_type == 'likelihood':
-            choices = batch['choices']
             input_ids = input_ids.to(model.device)
             with torch.no_grad():
-                logits = model(input_ids).logits
-            for i,logit in enumerate(logits):
-                conf_score = []
-                pred_dict = (ds.derive_prediction(logit[-1],choices[i],gen_kwargs['temperature'],num_samples)) # take last logit
-                greedy = pred_dict['greedy']
-                acc_score = int(greedy == answer[i])
-                acc.append(acc_score)
-                topic_acc[topics[i]].append(acc_score)
-                sampled = pred_dict['sampled']
-                for sample in sampled:
-                    if sample.lower() == greedy.lower():
-                        conf_score.append(1)
-                    else:
-                        conf_score.append(0)                
-                conf_score = np.mean(conf_score)
-                confidence_score_tracker.append((conf_score,acc_score)) # tuple of confidence and correct/wrong.
+                logits = model(input_ids).logits.detach().cpu()
+            ds.derive_prediction(logits,batch,pred_dict,answer_dict)
         elif ds_type == 'generation':
             pred = HF_generate(input_ids,model,tokenizer,gen_kwargs,use_tgi=use_tgi,return_as_dict=False,return_probs=True,max_workers=len(input_ids))
             if use_tgi:
@@ -107,31 +99,44 @@ def eval_fixed_ds(ds,model,model_name,tokenizer,ds_name,batch_size,ds_type= 'lik
             else:
                 sampled_pred = None
             for i,(p,a,topic) in enumerate(zip(pred_text,answer,topics)):
-                if ds_name != 'wiki':
+                if 'wiki' not in ds_name:
                     acc_score = ds.score_prediction(p,a,topic,extract_ans_fn)
-                    topic_acc[topic].append(acc_score)
                     acc.append(acc_score)
                 if sampled_pred is not None:
-                    hallucination_score.append(ds.score_hallucination(input_ids[i],pred[i],sampled_pred[i]))
-            if ds_name == 'wiki':
-                acc.append(0.) ##TODO find a way to work with FactScore with wiki.
-                continue
+                    hallu_score = ds.score_hallucination(input_ids[i],pred[i],sampled_pred[i])
+                    if hallu_score:
+                        hallucination_score.append(hallu_score)
+            if 'wiki' in ds_name: 
                 fs_score_dict = ds.score_prediction(pred_text,None,topics) # compute entire batch
                 acc_score = fs_score_dict['score']
-                # with open('testing.txt','w') as f:
-                #     for x in sum(fs_score_dict['decisions'],[]):
-                #         atom = x['atom']
-                #         supported = x['is_supported']
-                #         f.write(f'Fact: {atom}. Supported: {supported}'+'\n')
+                for topic,decisions in zip(fs_score_dict['topics'],fs_score_dict['decisions']):
+                    log_ = {}
+                    log_['topic'] = topic
+                    log_['document'] = ds.topic2docu.get(topic,'None')
+                    log_['results'] = []
+                    for x in decisions:
+                        atom = x['atom']
+                        supported = x['is_supported']
+                        log_['results'].append(f'Fact: {atom}. Supported: {supported}'+'\n')
+                    fs_logger.append(log_)
                 acc.append(acc_score)
                 
         else:
             raise NotImplementedError
+
+    if ds_type == 'likelihood':
+        for sample_id,sample in pred_dict.items():
+            greedy_choice = sorted(sample.items(),key = lambda x: x[1],reverse=True)[0][0]
+            if greedy_choice == answer_dict[sample_id]:
+                acc.append(1)
+            else:
+                acc.append(0)
     
     ## Compute final stats
     result_dict = {}
     result_dict['acc'] = sum(acc)/len(acc)
-    result_dict['topic_acc'] = {k:sum(v)/len(v) for k,v in topic_acc.items()}
+    if len(topic_acc) > 0:
+        result_dict['topic_acc'] = {k:sum(v)/len(v) for k,v in topic_acc.items()}
     
     ## Confidence and ECE
     if len(confidence_score_tracker) > 0:
@@ -144,5 +149,7 @@ def eval_fixed_ds(ds,model,model_name,tokenizer,ds_name,batch_size,ds_type= 'lik
             result_dict['hallucination_score'] = 1. - np.mean(hallucination_score).item() # since confidence, take complement
         else:
             result_dict['hallucination_score'] = np.mean(hallucination_score).item()
+    if len(fs_logger) > 0:
+        result_dict['fs_logs'] = fs_logger
     
     return result_dict

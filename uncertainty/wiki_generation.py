@@ -10,36 +10,76 @@ import pickle
 import random
 from utils import *
 from data_utils import *
-from templates import format_question_w_document,format_answer_w_document,truthful_qa_questions
+from templates import format_question_w_document,format_answer,question_generation_examples
+from topic_generator import get_embedding,get_related_topics,get_views_for_topic
 from functools import partial
 from copy import deepcopy
 from dataclasses import asdict
 import yaml
-from rouge_score import rouge_scorer
+# from rouge_score import rouge_scorer
 from types import SimpleNamespace
+from multiprocessing import Pool
+import spacy
 
-def open_generate_qns(client,scorer,topics,document_dict,max_workers,gen_kwargs,tokenizer,model_name,question_path=None,test_path=None,test_size=1000,qn_per_topic=1,use_tgi=True,ds_config=None):
+def open_generate_qns(client,
+                      scorer,
+                      topics,
+                      document_dict,
+                      max_workers,
+                      gen_kwargs,
+                      tokenizer,
+                      model_name,
+                      question_path=None,
+                      test_path=None,
+                      test_topics = [],
+                      qn_per_topic=1,
+                      use_tgi=True,
+                      question_filtering=False
+                      ):
+    
     is_instruct_tuned = if_instruction_tuned(model_name)
-    max_document_length = 2000
-    r_scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=False)
+    ans_call_fn = async_process if use_tgi else batch_ops
+    max_document_length = 1024
+    chunk_length = 512
+    sent_processor = spacy.load("en_core_web_sm")
     score_key = SCORE_KEY[scorer.scoring_method]
     dict_keys = {}
+    max_few_shots = 10 if 'llama' not in model_name.lower() else 5 # llama max context length is 2048
+    
+    ## Craft few-shots for qn and answer.
+    qn_few_shot = sum([[{'role':'user','content':format_question_w_document(fs['topic'],fs['document'])},
+                    {'role':'assistant','content':fs['question']}] for fs in question_generation_examples],[])[:max_few_shots]
+    ans_few_shot_ref = sum([[{'role':'user','content':format_answer(fs['question'],fs['document'])},
+                    {'role':'assistant','content':fs['answer']}] for fs in question_generation_examples],[])[:max_few_shots]
+    ans_few_shot_sample = sum([[{'role':'user','content':format_answer(fs['question'])}, # leave document out
+                    {'role':'assistant','content':fs['answer']}] for fs in question_generation_examples],[])[:max_few_shots]
     
     def tgi_generate(prompt,prompt_type = 'topic'):
         return client.text_generation(prompt, **gen_kwargs[prompt_type])
     
-    def generate_qns_prompt(topic,docu_dict,test_generation=False):
+    def generate_qns_prompt(topic,docu_dict,test_generation=False,num_few_shot=10):
+        out_list = []
         document = docu_dict[topic]
-        if len(tokenizer.encode(document,add_special_tokens=False)) > max_document_length:
-            document = tokenizer.decode(tokenizer.encode(document,add_special_tokens=False)[:max_document_length])
-        qn_prompt = format_question_w_document(topic,document)
-        if is_instruct_tuned or test_generation:
+        if test_generation:
+            chunked_documents = [tokenizer.decode(tokenizer.encode(document,add_special_tokens=False)[:max_document_length])]
+        else:
+            chunked_documents = chunk_document(document,tokenizer,sent_processor,chunk_length,qn_per_topic)
+        if len(chunked_documents) == 0:
+            return None
+        for doc in chunked_documents:
+            qn_prompt = format_question_w_document(topic,doc)
             qn_prompt = [{'role':'user','content':qn_prompt}]
-            if not test_generation:
-                qn_prompt = format_response(qn_prompt,model_name,tokenizer,mode='question')
-        return {'topic':topic,'instruction':qn_prompt,'document':document}
+            qn_prompt = qn_few_shot[:int(num_few_shot*2)] + qn_prompt
+            if is_instruct_tuned or test_generation:
+                if not test_generation:
+                    qn_prompt = format_response(qn_prompt,model_name,tokenizer,mode='question')
+            else:
+                qn_prompt = join_non_instruct(qn_prompt)
+            out_list.append({'topic':topic,'instruction':qn_prompt,'document':doc})
+        return out_list
     
-    def generate_ans(qns_dicts):
+    def generate_ans(qns_dicts,type_ ='ref_answer'):
+        assert type_ in ['ref_answer','sample_answer','question_filtering'], 'Invalid type.'
         if use_tgi:
             qns_dicts = [qns_dicts]
         else:
@@ -48,29 +88,34 @@ def open_generate_qns(client,scorer,topics,document_dict,max_workers,gen_kwargs,
             qns = qns_dict['instruction']
             topic = qns_dict['topic']
             document = qns_dict['document']
-            sample_ans_prompt = [{'role':'user','content':qns}]
-            ref_ans_prompt = [{'role':'user','content':format_answer_w_document(qns,document)}]
+            if type_ in ['ref_answer','question_filtering']:
+                ans_fs = ans_few_shot_ref
+            else:
+                ans_fs = []
+                document = ''
+            ans_prompt = ans_fs + [{'role':'user','content':format_answer(qns,document)}]
             if is_instruct_tuned:
-                sample_ans_prompt = format_response(sample_ans_prompt,model_name,tokenizer,mode='answer')
-                ref_ans_prompt = format_response(ref_ans_prompt,model_name,tokenizer,mode='answer')
+                ans_prompt = format_response(ans_prompt,model_name,tokenizer,mode='answer')
             else:
-                sample_ans_prompt = sample_ans_prompt[0]['content']
-                ref_ans_prompt = ref_ans_prompt[0]['content']
+                ans_prompt = join_non_instruct(ans_prompt)
             if use_tgi:
-                ref_answer = tgi_generate(ref_ans_prompt,prompt_type='ref_answer')
-                sample_answer = tgi_generate(sample_ans_prompt,prompt_type='sample_answer')
-                return {'sample_answer':sample_answer,'ref_answer':ref_answer,'instruction':qns,'topic':topic}
+                try:
+                    ans = tgi_generate(ans_prompt,prompt_type=type_)
+                    return {'instruction':qns,'topic':topic,type_:ans,'document':document}
+                except Exception as e:
+                    print (e)
+                    return None
             else:
-                inp_batch.append({'sample_answer':sample_ans_prompt,'ref_answer':ref_ans_prompt,'instruction':qns,'topic':topic})
+                inp_batch.append({'instruction':ans_prompt,'topic':topic,type_:ans_prompt,'document':document})
         if not use_tgi:
-            out_batch = [{'topic':x['topic'],'instruction':x['instruction']} for x in inp_batch]
-            for ans_type in ['sample_answer','ref_answer']:
-                i_batch = [{ans_type: x[ans_type]} for x in inp_batch]
-                dict_keys['input'] = ans_type
-                dict_keys['output'] = ans_type
-                gen_batch = HF_generate(i_batch,client,tokenizer,gen_kwargs[ans_type],max_workers=len(i_batch),dict_keys=dict_keys,return_probs=True)
-                for o,g in zip(out_batch,gen_batch):
-                    o[ans_type] = g[ans_type]
+            out_batch = [{'topic':x['topic'],'instruction':x['instruction'],'document':x['document']} for x in inp_batch]
+            ans_batch = [{type_:x[type_]} for x in inp_batch]
+            dict_keys['input'] = type_
+            dict_keys['output'] = type_
+            generate_args = gen_kwargs[type_]
+            gen_batch = HF_generate(ans_batch,client,tokenizer,generate_args,max_workers=len(ans_batch),dict_keys=dict_keys,return_probs=True)
+            for o,g in zip(out_batch,gen_batch):
+                o[type_] = g[type_]
             return out_batch 
         
     def get_scored_ds(ans_dict):
@@ -78,98 +123,113 @@ def open_generate_qns(client,scorer,topics,document_dict,max_workers,gen_kwargs,
         for ans_d in tqdm(ans_dict,total = len(ans_dict),desc=f'Scoring questions based on {scorer.scoring_method}'):
             try:
                 ref_ans = ans_d['ref_answer']
-                sample_ans = ans_d['sample_answer']
+                if 'sample_answer' in ans_d:
+                    sample_ans = ans_d['sample_answer']
+                    return_full_dict = True
+                else:
+                    sample_ans = ans_d['question_filtering']
+                    ans_d.pop('question_filtering')
+                    return_full_dict = False
                 instruction = ans_d['instruction']
                 score_dict = scorer.get_score(instruction,ref_ans,sample_ans)
                 if score_dict == None:
                     continue
-                score_dict = {**ans_d,**score_dict}
+                if return_full_dict:
+                    score_dict = {**ans_d,**score_dict}
+                else:
+                    score_dict = {**ans_d,score_key:score_dict[score_key]} # just need the score.
                 all_qn_confidences.append(score_dict)
             except Exception as e:
                 print (e)
         return all_qn_confidences
     
-    if not os.path.exists(question_path):
-        qns_prompts = [generate_qns_prompt(topic,document_dict) for topic in topics]
-        if use_tgi:
-            dict_keys['input'] = 'instruction'
-            dict_keys['output'] = 'instruction'
-        qns_dict = HF_generate(qns_prompts,client,tokenizer,gen_kwargs['questions'],use_tgi=use_tgi,max_workers=max_workers,dict_keys=dict_keys,msg = 'Generating questions')
-        # Check for duplicates.# 
-        if qn_per_topic > 1:
-            non_duplicate_qns = []
-            for q in tqdm(qns_dict,total = len(qns_dict),desc = 'Removing duplicates'):
-                n_instructions = q['instruction']
-                if use_tgi:
-                    n_instructions = [n_instructions.generated_text] + [qq.generated_text for qq in n_instructions.details.best_of_sequences]
-                else:
-                    n_instructions = sum(n_instructions,[])
-                non_duplicate_qns.append({'topic':q['topic'],'document':q['document'],'instruction':n_instructions[0]}) # first include the 1st.
-                
-                # check with the rest of the instruction for duplicates
-                checking_instr = [n_instructions[0]]
-                for remaining_instr in n_instructions[1:]:
-                    if not is_duplicate(r_scorer,remaining_instr,checking_instr,max_rouge=0.7):
-                        non_duplicate_qns.append({'topic':q['topic'],'document':q['document'],'instruction':remaining_instr})
-                        checking_instr.append(remaining_instr)
-                        
-            print (f'removed {(len(qns_dict)*qn_per_topic) - len(non_duplicate_qns)} duplicate questions')
-        else:
-            if use_tgi:
-                q['instruction'] = q['instruction'].generated_text
-            non_duplicate_qns = qns_dict
-
-        if use_tgi:
-            ans_dict = async_process(generate_ans,non_duplicate_qns,max_workers,msg = 'Generating answers')
-        else:
-            ans_dict = []
-            for batch_i in tqdm(range(0,len(non_duplicate_qns),max_workers),total = len(non_duplicate_qns)//max_workers,desc='Generating answers'):
-                batch = non_duplicate_qns[batch_i:batch_i+max_workers]
-                ans_batch = generate_ans(batch)
-                ans_dict.extend(ans_batch)
-        with open(question_path,'wb') as f:
-            pickle.dump(ans_dict,f)
-    else:
-        with open(question_path,'rb') as f:
-            ans_dict = pickle.load(f)
-
-    # Generate test questions using a separate LLM - GPT3.5-instruct
+    ###################
+    ## GENERATE TEST ##
+    ####################
     if not os.path.exists(test_path):
-        unique_topics = set([t['topic'] for t in ans_dict])
-        existing_topic_questions = defaultdict(list)
-        for t in ans_dict:
-            existing_topic_questions[t['topic']].append(t['instruction'])
-        test_topics = list(unique_topics)[:test_size] # assume that test size is at most num topics
-        document_ds = get_wiki(-1,ds_config,get_ds=True)
-        document_dict = {d['title']:d['text'] for d in document_ds if d['title'] in test_topics}
-        test_qn_prompts = [generate_qns_prompt(topic,document_dict,test_generation=True) for topic in test_topics]
+        assert len(test_topics) > 0,'No test topics to generate questions for.'
+        test_qn_prompts = [generate_qns_prompt(t,document_dict,test_generation=True) for t in test_topics] # just set 1 few-shot
+        test_qn_prompts = [q for q in test_qn_prompts if q is not None]
+        test_qn_prompts = sum(test_qn_prompts,[]) # flatten
         test_ds = []
+        total_cost = 0.
         for tp in tqdm(test_qn_prompts,total = len(test_qn_prompts),desc = 'Generating test questions'):
             num_tries = 0
             while num_tries < 5:
-                test_qn = openai_call('gpt-3.5-turbo-instruct',tp['instruction'],max_tokens=gen_kwargs['questions']['max_new_tokens'],temperature=gen_kwargs['questions']['temperature'])
-                if test_qn is None:
-                    break
-                if not is_duplicate(r_scorer,test_qn,existing_topic_questions[tp['topic']],max_rouge=0.5):
+                test_qn,cost = openai_call('gpt-3.5-turbo-instruct',tp['instruction'],max_tokens=gen_kwargs['questions']['max_new_tokens'],temperature=gen_kwargs['questions']['temperature'])
+                total_cost += cost
+                if check_question(test_qn):
                     break
                 else:
                     num_tries += 1
             if test_qn is not None:
                 test_ds.append({'topic':tp['topic'],'document':tp['document'],'instruction':test_qn})
-        
+        print ('Total cost:',total_cost)
         with open(test_path,'w') as f:
             for instance in test_ds:
                 json.dump(instance,f,ensure_ascii=False)
                 f.write('\n')
-    if score_key not in ans_dict[0]: # not yet scored.
+    
+    if not os.path.exists(question_path):
+        #######################
+        ## GENERATE QUESTION ##
+        #######################
+        qns_prompts_dict = [generate_qns_prompt(topic,document_dict) for topic in topics[:2]]
+        qns_prompts = [q for q in qns_prompts_dict if q is not None]
+        qns_prompts = sum(qns_prompts,[]) # flatten
+        if use_tgi:
+            dict_keys['input'] = 'instruction'
+            dict_keys['output'] = 'instruction'
+        qns_dict = HF_generate(qns_prompts,client,tokenizer,gen_kwargs['questions'],use_tgi=use_tgi,max_workers=max_workers,dict_keys=dict_keys,msg = 'Generating questions')
+        checked_qns_dict = []
+        for q in qns_dict: # clean the question.
+            if check_question(q['instruction']):
+                q['instruction'] = clean_question(q['instruction'])
+                checked_qns_dict.append(q)
+        print (f'Removed {len(qns_dict)-len(checked_qns_dict)} questions due to bad quality.')
+        qns_dict = checked_qns_dict
+        
+        #######################
+        ## GENERATE ANSWER ##
+        #######################
+        ref_ans_fn = partial(generate_ans,type_='ref_answer')
+        ref_ans_content = filter_none(ans_call_fn(ref_ans_fn,qns_dict,max_workers,msg = 'Generating ref answers'))
+        ref_ans_content = check_answer(ref_ans_content) # filter the answer for any "i cannot answer"
+        print (ref_ans_content[0].keys())
+        if question_filtering:
+            qn_filter_fn = partial(generate_ans,type_='question_filtering')
+            qn_filter_ans = filter_none(ans_call_fn(qn_filter_fn,ref_ans_content,max_workers,msg = 'Generating hallucination score to filter questions'))
+            print (qn_filter_ans[0].keys())
+            scored_qns = get_scored_ds(qn_filter_ans) # get question quality score
+            print (scored_qns[0].keys())
+            filtered_qns = return_question_type(scored_qns,scorer.scoring_method,'known') # filter out poor questions
+        else:
+            filtered_qns = ref_ans_content
+        sample_ans_fn = partial(generate_ans,type_='sample_answer')
+        ans_dict = filter_none(ans_call_fn(sample_ans_fn,filtered_qns,max_workers,msg = 'Generating sample answers'))
+        print (ans_dict[0].keys())
+        exit()
+        with open(question_path,'wb') as f:
+            pickle.dump(ans_dict,f)
+    else:
+        with open(question_path,'rb') as f:
+            ans_dict = pickle.load(f)
+    
+    ####################
+    ## GENERATE SCORE ##
+    ####################    
+    if score_key not in ans_dict[0]: 
         all_qn_confidences = get_scored_ds(ans_dict)
-        with open(question_path,'wb') as f: # re-update the question_set with other approach scores.
+        with open(question_path,'wb') as f: 
             pickle.dump(all_qn_confidences,f)
     else:
         all_qn_confidences = ans_dict
-    # Split into unknown and known to generate dpo samples
-    unknown_qns = return_question_type(all_qn_confidences,scorer.scoring_method)
-    get_ds_fn = partial(scorer.get_dpo_sample,few_shots=None)
+        
+    #########################
+    ## GENERATE DPO SAMPLE ##
+    #########################
+    unknown_qns = return_question_type(all_qn_confidences,scorer.scoring_method,'unknown')
+    get_ds_fn = partial(scorer.get_dpo_sample,fs_messages=ans_few_shot_sample)
     generated_ds = []
     for unknwn_qn in tqdm(unknown_qns,desc='Generating dpo samples',total = len(unknown_qns)):
         try:
@@ -177,6 +237,7 @@ def open_generate_qns(client,scorer,topics,document_dict,max_workers,gen_kwargs,
         except Exception as e:
             print (e)
     generated_ds = [t for t in generated_ds if t is not None]
+    
     return generated_ds
         
 def main():
@@ -186,19 +247,21 @@ def main():
     ## Dataset curation ##
     parser.add_argument("--answer_generator", type=str, default="self_fewshot",required=True)
     parser.add_argument("--scoring_method", type=str, default="BSDetector",required=True)
-    parser.add_argument("--topic_generator", type=str, default="fixed_mmlu",required=True)
+    parser.add_argument("--topic_generator", type=str, default="wiki",required=True)
     parser.add_argument("--use_tgi", action='store_true',help = 'use TGI for loaded model to do eval')
     parser.add_argument("--max_response_tokens", type=int, default=256,help = 'max tokens for answer generation')
     parser.add_argument("--num_topics",  type = int,default = 200,help = 'total qns to generate')
-    parser.add_argument("--num_concurrent_calls", type=int, default=64,help = 'max_api_calls to TGI at a time')
     parser.add_argument("--num_samples", type=int, default=5,help = 'number of sampled responses')
     parser.add_argument("--filter_size",  type = float,default = 1.0,help = 'Top questions to take based on confidence/uncertainty')
     parser.add_argument("--questions_per_topic",  type = int,default = 10)
-    parser.add_argument("--test_size",  type = int,default = 500)
+    parser.add_argument("--test_size",  type = int,default = 300)
     parser.add_argument("--beta",  type = float,default = 1.0,help = 'Trade-off between observed and self-reflected confidence, for BSDetector only.')
     parser.add_argument("--answer_generator_port", type=int, default=8083,help = 'port for TGI to generate answer, only used for mistral_8x7 if loaded locally.')
+    parser.add_argument("--question_filtering",  action = 'store_true',help= 'to filter question based on hallucination score.')
     parser.add_argument("--openai_api_key_path",  type = str,default = 'openai_api_key.txt',help = 'a text file for openai api key, required only if using factscorer.')
     args = parser.parse_args()
+    
+    args.num_concurrent_calls = np.floor(320/args.num_samples).astype(int).item() # set max request at 320.
     
     ## Seed ## 
     torch.manual_seed(42)
@@ -209,8 +272,7 @@ def main():
     with open(args.config_path,'r') as f:
         config = SimpleNamespace(**yaml.safe_load(f))
     
-    ds_name = 'wiki'
-    ds_config_path = f'configs/data/{ds_name}.yaml'
+    ds_config_path = f'configs/data/wiki.yaml'
     with open(ds_config_path,'r') as f:
         ds_config = yaml.safe_load(f)
     
@@ -220,11 +282,14 @@ def main():
         scoring_name = 'entropy'
     else:
         scoring_name = 'hallu'
+    ## Training path ##
     config.train_dataset_path = config.train_dataset_path.format(topic_generator=args.topic_generator,
                                                                  answer_generator=args.answer_generator,
                                                                 scoring_name=scoring_name)
-    ds_config['test_dataset_path'] = ds_config['test_dataset_path'].format(dataset_name = ds_name)
-
+    if args.question_filtering:
+        config.train_dataset_path = config.train_dataset_path.replace('.jsonl','_qf.jsonl')
+    ## Test path ##
+    ds_config['test_dataset_path'] = ds_config['test_dataset_path'].format(dataset_name = args.topic_generator)
     if args.answer_generator in ['gpt4,gpt3.5'] or not os.path.exists(ds_config['test_dataset_path']):
         assert args.openai_api_key_path != '','Need to provide openai api key for gpt4/gpt3.5'
         with open(args.openai_api_key_path,'r') as f:
@@ -235,6 +300,8 @@ def main():
     
     ## Question path ##
     config.question_path = config.question_path.format(topic_generator=args.topic_generator)
+    if args.question_filtering:
+        config.question_path = config.question_path.replace('.pkl','_qf.pkl')
     
     ## create dirs
     for required_paths in [config.train_dataset_path,ds_config['test_dataset_path'],config.question_path,]:
@@ -247,7 +314,8 @@ def main():
     
     ## Generate kwargs
     gen_kwargs = {'topic':{'max_new_tokens':5, 'do_sample':True, 'temperature':1.0,'repetition_penalty':1.1},
-                    'questions':{'max_new_tokens':ds_config.get('max_question_tokens',128), 'do_sample':True, 'temperature':1.0,'repetition_penalty':1.1,'details':True,'best_of':args.questions_per_topic},
+                    'questions':{'max_new_tokens':ds_config.get('max_question_tokens',128), 'do_sample':False,'repetition_penalty':1.1},
+                    'question_filtering':{'max_new_tokens':ds_config.get('max_response_tokens',128), 'do_sample':True, 'temperature':0.5,'best_of':args.num_samples,'repetition_penalty':1.1,'details':True},
                     'ref_answer':{'max_new_tokens':ds_config.get('max_response_tokens',128), 'do_sample':False, 'repetition_penalty':1.1,'details':True},
                     'sample_answer':{'max_new_tokens':ds_config.get('max_response_tokens',128), 'do_sample':True, 'temperature':1.0,'best_of':args.num_samples,'repetition_penalty':1.1,'details':True}}
     
@@ -258,9 +326,59 @@ def main():
         client = load_hf_model(config.model_name,quantized=True)
     
     base_tokenizer = load_tokenizer(config.model_name)
-
+    if not args.use_tgi:
+        base_tokenizer.padding_side = 'left'
     # Get random topics with supporting document from wiki
-    all_topics,sup_documents = get_wiki(args.num_topics,ds_config)
+    embedding_topic_path = 'data/embeddings/wiki.pkl'
+    accepted_topic_doc_path = 'data/embeddings/accepted_topic_doc.pkl'
+    os.makedirs('data/embeddings',exist_ok=True)
+    if not os.path.exists(accepted_topic_doc_path): ## get documents longer than a certain length.
+        topic2docu = {}
+        wiki_ds = get_wiki(-1,ds_config,get_ds=True)
+        for d in tqdm(wiki_ds,total=len(wiki_ds)):
+            if len(d['text'].split()) > 512:
+                topic2docu[d['title']] = d['text']
+        with open(accepted_topic_doc_path,'wb') as f:
+            pickle.dump(topic2docu,f)
+    else:
+        with open(accepted_topic_doc_path,'rb') as f:
+            topic2docu = pickle.load(f)
+        
+    if not os.path.exists(embedding_topic_path):
+        wiki_topics = list(topic2docu.keys())
+        embedding_dict = get_embedding(wiki_topics,embedding_topic_path)
+    else:
+        with open(embedding_topic_path,'rb') as f:
+            embedding_dict = pickle.load(f)
+
+    if config.topic_generator == 'wiki':
+        if os.path.exists(ds_config['test_dataset_path']): # already exist, no need gather test topics.
+            embedding_dict = None
+        all_topics,sup_documents,test_topics = get_wiki(args.num_topics,ds_config,num_test_topics= args.test_size,embedding_dict=embedding_dict,topic2docu=topic2docu)
+    else: # get topics based on predefined topics like in MMLU.
+        assert config.topic_generator == 'wiki_mmlu','Only mmlu is supported for now.' #TODO support more benchmarks providing useful topics.
+        query_topics = get_fixed_topics(config.topic_generator)
+        for i,t in enumerate(query_topics):
+            if '_' in t:
+                query_topics[i] = t.replace('_',' ')
+        if not os.path.exists(ds_config['test_dataset_path']):
+            to_take = args.num_topics + args.test_size
+        else:
+            to_take = args.num_topics
+        
+        k_per_topic = np.ceil(to_take/(len(query_topics))).astype(int).item()
+        all_topics = get_related_topics(embedding_dict,query_topics,k_per_topic)
+        sup_documents = {k:topic2docu[k] for k in all_topics if k in topic2docu}
+        accepted_topics = list(sup_documents.keys())
+        if len(accepted_topics) != len(all_topics):
+            print (f'Gathered {len(accepted_topics)} out of {len(all_topics)} required.')
+        all_topics = accepted_topics
+        if not os.path.exists(ds_config['test_dataset_path']):
+            random.shuffle(all_topics)
+            test_topics = all_topics[:args.test_size]
+            all_topics = all_topics[args.test_size:]
+        else:
+            test_topics = []
 
     # scorer
     scorer = NLIScorer(client,config.model_name,base_tokenizer,config.scoring_method,args.beta,max_response_tokens=ds_config.get('max_response_tokens',128),answer_generator=config.answer_generator,answer_generator_port=args.answer_generator_port,ref_as_chosen=True) # set ref_as_chosen as true.
@@ -275,10 +393,11 @@ def main():
                                              config.model_name,
                                              question_path=config.question_path,
                                              test_path = ds_config['test_dataset_path'],
-                                             test_size = args.test_size,
+                                             test_topics = test_topics,
                                              qn_per_topic = args.questions_per_topic,
                                              use_tgi=args.use_tgi,
-                                             ds_config=ds_config)
+                                             question_filtering = args.question_filtering
+                                             )
 
     with open(config.train_dataset_path,'w') as f:
         for instance in train_unknown_qns:

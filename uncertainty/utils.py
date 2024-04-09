@@ -34,13 +34,17 @@ def load_hf_model(model_name,quantized=False): ## if use tgi, dont quantize.
     )
     return base_model
 
-def load_tokenizer(model_name,padding_side = "left"):
+def load_tokenizer(model_name,padding_side = "",truncation_side = ""):
     tokenizer =  AutoTokenizer.from_pretrained(
         model_name,
-        use_fast=True,
-        padding_side = padding_side)
-    tokenizer.pad_token_id = tokenizer.eos_token_id
-    tokenizer.model_max_length = 2048
+        use_fast=True,)
+    if padding_side != "":
+        tokenizer.padding_side = padding_side
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    if truncation_side != "":
+        tokenizer.truncation_side = truncation_side
+    tokenizer.model_max_length = 4096
     if 'mistral-7b' in model_name.lower():
         if 'instruct' not in model_name.lower():
             chat_template = "{{ bos_token }}{% for message in messages %}{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}{% endif %}{% if message['role'] == 'user' %}{{ '[INST] ' + message['content'] + ' [/INST]' }}{% elif message['role'] == 'assistant' %}{{ message['content'] + eos_token + ' ' }}{% else %}{{ raise_exception('Only user and assistant roles are supported!') }}{% endif %}{% endfor %}"
@@ -49,6 +53,8 @@ def load_tokenizer(model_name,padding_side = "left"):
         if 'chat' not in model_name.lower():
             chat_template = "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}"
             tokenizer.chat_template = chat_template
+    elif 'zephyr' in model_name.lower():
+        tokenizer.chat_template = "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}"
     return tokenizer
 
 def openai_call(model,message,max_tokens,temperature=0.):
@@ -57,9 +63,13 @@ def openai_call(model,message,max_tokens,temperature=0.):
     num_calls = 0
     while True:
         if num_calls >= max_calls:
-            return None
+            return None,None
         try:
-            prompt = [m['content'] for m in message if m['role'] == 'user'][0]
+            prompt = ''
+            for m in message:
+                prompt += m['content']
+                if m['role'] == 'assistant':
+                    prompt += '\n\n'
             if 'instruct' in model.lower():
                 response = client.completions.create(
                 model=model,
@@ -67,7 +77,8 @@ def openai_call(model,message,max_tokens,temperature=0.):
                 temperature=temperature,
                 max_tokens=max_tokens,
                 )
-                return response.choices[0].text
+                cost = cal_cost(model,response.usage.prompt_tokens,response.usage.completion_tokens)
+                return response.choices[0].text,cost
             else:
                 response = client.chat.completions.create(
                     model=model,
@@ -75,11 +86,22 @@ def openai_call(model,message,max_tokens,temperature=0.):
                     temperature=temperature,
                     max_tokens=max_tokens,
                     )
-                return response.choices[0].message.content 
+                cost = cal_cost(model,response.usage.prompt_tokens,response.usage.completion_tokens)
+                return response.choices[0].message.content,cost
         except Exception as e:
             num_calls += 1
             print(f'Failing Openai call due to {e}, remaining calls: {max_calls - num_calls}')
-    
+
+def cal_cost(model_name,in_tokens,out_tokens):
+    if model_name == 'gpt-4-0125-preview':
+        cost = in_tokens * (10/1e6) + (out_tokens * (30/1e6))
+    elif model_name == 'gpt-3.5-turbo-0125':
+        cost = in_tokens * (0.5/1e6) + (out_tokens * (1.5/1e6))
+    elif model_name == 'gpt-3.5-turbo-instruct':
+        cost = in_tokens * (1.5/1e6) + (out_tokens * (2/1e6))
+    else:
+        raise NotImplementedError
+    return cost
 
 def tgi_to_gen_kwargs(gen_kwargs): # convert TGI kwargs to HF kwargs
     if 'details' in gen_kwargs:
@@ -120,9 +142,9 @@ def HF_generate(inps,model,tokenizer,gen_kwargs,use_tgi=False,return_probs=False
                 logprobs = None
             if gen_kwargs.get('num_return_sequences',1) > 1:
                 num_seq = gen_kwargs['num_return_sequences']
-                decoded = [d[i:i+num_seq] for i in range(0,len(d),num_seq)]
+                decoded = [decoded[i:i+num_seq] for i in range(0,len(decoded),num_seq)]
                 if logprobs is not None:
-                    logprobs = [lp[i:i+num_seq] for i in range(0,logprobs.shape[0],num_seq)]
+                    logprobs = [logprobs[i:i+num_seq] for i in range(0,logprobs.shape[0],num_seq)]
             if logprobs is not None:
                 for d,lp,inp_b in zip(decoded,logprobs,inp_batch):
                     if return_as_dict:
@@ -144,8 +166,7 @@ def tgi_generate(inps,model,gen_kwargs,max_workers,return_as_dict=True,dict_keys
         if return_as_dict:
             prompt = inputs[dict_keys['input']]
             gen = model.text_generation(prompt, **gen_kwargs)
-            inputs.pop(dict_keys['input'])
-            return {dict_keys['output']:gen,**inputs}
+            return {dict_keys['output']:gen,**{k:v for k,v in inputs.items() if k != dict_keys['input']}}
         else:
             return model.text_generation(inputs, **gen_kwargs)
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(inps),max_workers)) as executor:
@@ -155,14 +176,21 @@ def tgi_generate(inps,model,gen_kwargs,max_workers,return_as_dict=True,dict_keys
             out = list(executor.map(tgi_generate,inps))
     return out
 
+def batch_ops(fn,inputs,batch_size,msg =''):
+    out = []
+    for batch_i in tqdm(range(0,len(inputs),batch_size),total = len(inputs)//batch_size,desc=msg):
+        batch = inputs[batch_i:batch_i+batch_size]
+        out_batch = fn(batch)
+        out.extend(out_batch)
+    return out
 
 def get_extract_template(model_name,instruction_tuned): # get extract template (only used if TGI not used)
     if instruction_tuned:
         if 'neural-chat-7b' in model_name:
             extract_fn = lambda x: x.split("### Assistant:\n")[-1].strip()
-        elif 'Mistral' in model_name or 'zephyr' in model_name:
+        elif 'mistral' in model_name.lower() or 'zephyr' in model_name.lower():
             extract_fn = lambda x : x.split(" [/INST]")[-1].strip()
-        elif 'Llama' in model_name:
+        elif 'llama' in model_name.lower():
             extract_fn = lambda x: x.split("<|assistant|>\n")[-1].strip()
         else:
             extract_fn = lambda x: x
@@ -179,14 +207,14 @@ def format_response(response,model_name,tokenizer,mode = 'question'):
     response is assumed to already be in [{'role':'user','content':str}]
     """
     if mode == 'question':
-        system_prompt = "You are a student who is eager to learn about new things." # only use if question generation
+        system_prompt = "You are a student who is eager to learn about new things. You are to form a question that you lack knowledge in." # only use if question generation
     else:
-        system_prompt = ""
+        system_prompt = ''
     
-    if 'neural-chat-7b' in model_name or 'Llama' in model_name: # Mistral doesnt have system prompt
+    if 'mistral' not in model_name.lower() and mode != 'training_label': # Mistral doesnt have system prompt
         sys_msg = [{'role':'system','content':system_prompt}]
         response = sys_msg + response
-    if mode != 'label':
+    if 'training' not in mode:
         formatted_msg = tokenizer.apply_chat_template(response,tokenize=False,add_generation_prompt=True)
     else:
         formatted_msg = tokenizer.apply_chat_template(response,tokenize=False,add_generation_prompt=False)
@@ -215,36 +243,51 @@ def format_instruction_response(model_name): # only used for SFT training
     Add markers directly without chat template
     return the formatting func and response_fn
     """
-    if 'mistral' in model_name:
+    if 'mistral' in model_name.lower():
         return "<s>[INST] {instruction} [/INST] {output}</s>", "[/INST]"
-    elif 'Llama' in model_name:
+    elif 'llama' in model_name.lower() or 'zephyr' in model_name.lower():
         return "<|user|>\n{instruction}</s>\n<|assistant|>\n{output}</s>", "<|assistant|>"
 
-def clean_question(question,len_fs):
-    """
-    given question in "question\n{digit}: question\n{digit+1} ..."
-    return question, digit should be > len_fs
-    """
-    # if 'question:' in question.lower():
-    #     take_pos = question.lower().find('question:') + len('question:')
-    #     question = question[take_pos:].strip()
-    match = re.search(r'(\d+):', question)
-    if match:
-        digit = int(match.group(1))  # Convert the found digits to an integer
-        if digit > len_fs:
-            # If the digit is above the threshold, extract everything before the digit
-            return question[:match.start()].strip()
-        else:
-            return question.split('\n\n')[0].strip()
-    else:
-        return question.split('\n\n')[0].strip()
+def check_question(question):
+    if 'based on' in question.lower() or 'according to' in question.lower():
+        if 'document' in question or 'information' in question or 'text' in question or 'passage' in question:
+            return False
+    return True
 
-def clean_answer(answer):
+def clean_question(question):
+    if '?' in question:
+        question = question.split('?')[0].strip()+ '?'
+    return question
+
+def clean_non_instructed_answer(answer):
     if 'Q:' in answer: # Clean off excess text
         answer = answer.split('Q:')[0].strip()
     else:
         answer.split('\n\n')[0].strip()
     return answer
+
+
+
+def check_answer(ds,key = 'ref_answer'):
+    filtered_ds = []
+    for d in ds:
+        ans = d[key]
+        if 'there is no' in ans:
+            if 'mention' in ans or 'record' in ans or 'information' in ans or 'data' in ans or 'evidence' in ans:
+                continue
+        if 'i apologize' in ans or 'i cannot answer' in ans:
+            continue
+        if 'Question:' in ans:
+            ans = ans.split('Question:')[0].strip()
+            d[key] = ans
+        filtered_ds.append(d)
+    return filtered_ds
+
+
+
+
+def filter_none(x):
+    return [xx for xx in x if xx is not None]
 
 def extract_str_in_bracket(x):
     pattern = r"\((.*?)\)"
@@ -254,34 +297,6 @@ def extract_str_in_bracket(x):
         return extracted_text
     else:
         return x
-
-def get_nouns_and_embeddings(embedder: SentenceTransformer) -> Dict:
-    # nltk.download('omw-1.4')
-    from nltk.corpus import wordnet as wn
-    dir_storage = "data"
-    os.makedirs(dir_storage, exist_ok=True)
-    wordnet_data_path = dir_storage + "/wordnet_data.pkl"
-    if os.path.exists(wordnet_data_path):
-        with open(wordnet_data_path, "rb") as dump_handle:
-            wordnet_data = pickle.load(dump_handle)
-    else:
-        all_nouns = []
-        for synset in wn.all_synsets("n"):
-            lemma_names = [str(lemma.name()) for lemma in synset.lemmas()]
-            lemma_descs = [str(synset.definition()) for lemma in synset.lemmas()]
-            lemms = [n + " ### " + d for n, d in zip(lemma_names, lemma_descs)]
-            all_nouns.extend(lemms)
-        all_nouns = list(set(all_nouns))
-        all_embeddings = embedder.encode(all_nouns, device="cpu", convert_to_numpy=True)
-        wordnet_data = {"all_nouns": all_nouns, "all_embeddings": all_embeddings}
-        with open(wordnet_data_path,'wb') as dump_handle:
-            pickle.dump(wordnet_data, dump_handle)
-    return wordnet_data
-
-def get_topic_embedding_space(all_embeddings: List) -> KDTree:
-    all_embeddings = torch.tensor(all_embeddings)
-    all_embeddings = torch.nn.functional.normalize(all_embeddings, p=1, dim=-1)
-    return KDTree(all_embeddings)
 
 def get_current_device() -> int:
     """Get the current device. For GPU we return the local process index to enable multiple GPU training."""
@@ -304,6 +319,8 @@ def if_instruction_tuned(model_name):
             return False
     elif 'mixtral-8x7b' in model_name.lower():
         return True
+    elif 'zephyr' in model_name.lower():
+        return True
     else:
         raise NotImplementedError
 
@@ -320,3 +337,20 @@ def return_question_type(data,scoring_method,type_ = 'unknown'):
     if type_ == 'unknown':
         return unknown_qns
     return known_qns
+
+def process_document(args):
+    d, all_topics = args
+    if d['title'] in all_topics:
+        if len(d['text'].split()) > 200:
+            return d['title'], d['text']
+        else:
+            return None, None
+    return None, None
+
+def join_non_instruct(messages):
+    out = ''
+    for m in messages:
+        out += m['content']
+        if m['role'] == 'assistant':
+            out += '\n\n'
+    return out

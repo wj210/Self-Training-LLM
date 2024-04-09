@@ -11,9 +11,9 @@ import time
 import os
 from torch.utils.data import DataLoader
 from collections import defaultdict
-from uncertainty.utils import tgi_to_gen_kwargs,HF_generate,get_kbit_device_map,format_response,format_instruction_response
-from uncertainty.templates import format_question_generation
-from uncertainty.scorer import LLMJudge
+from utils import tgi_to_gen_kwargs,HF_generate,get_kbit_device_map,format_response,format_instruction_response
+from templates import format_question_generation
+from scorer import LLMJudge
 import yaml
 from sklearn.metrics import roc_auc_score
 import inspect
@@ -52,23 +52,20 @@ def create_train_ds(ds, questions_with_hallucination, prompt_format_fn):
     })
 
 def list_to_hf_ds(ds,model_name,tokenizer,test=False,mode ='dpo'):
-    prompt_msg_fn = lambda x : format_response([{'role':'user','content':x}],model_name,tokenizer,mode='answer')
-
+    prompt_msg_fn = lambda x : format_response([{'role':'user','content':x}],model_name,tokenizer,mode='training')
+    ans_prompt_fn = lambda x : format_response([{'role':'assistant','content':x}],model_name,tokenizer,mode='training_label')
     if not test:
         if mode == 'dpo':
             return HFDataset.from_dict({
                 'prompt': [prompt_msg_fn(x['instruction']) for x in ds],
-                'chosen': [x['chosen_ans'] + "</s>" for x in ds],
-                'rejected': [x['rejected_ans'] + "</s>" for x in ds]
+                'chosen': [ans_prompt_fn(x['chosen_ans']) for x in ds], # dont add eos token as DPO already added.
+                'rejected': [ans_prompt_fn(x['rejected_ans']) for x in ds]
             })
         elif mode == 'sft':
             # message = [format_response([{'role':'user','content':x['instruction']},
             #             {'role':'assistant','content':x['chosen_ans']}],model_name,tokenizer,mode='label') for x in ds] # dont add generation prompt
             # return HFDataset.from_dict({'prompt':message})
-            return HFDataset.from_dict({'prompt':[x['instruction'] for x in ds],
-                                        'completion':[x['chosen_ans'] for x in ds]
-                                        })
-            
+            return HFDataset.from_dict([{'text':format_response([{'role':'user','content':x['instruction']},{'role':'assistant','content':x['answer']}],model_name,tokenizer,mode='empty')} for x in ds])
         else:
             raise ValueError('Mode not supported')
     else:
@@ -80,14 +77,13 @@ def list_to_hf_ds(ds,model_name,tokenizer,test=False,mode ='dpo'):
 
 def do_train(
         ds,
-        tokenizer,
-        model_name_or_path,
+        val_ds = None,
+        tokenizer = None,
+        model_name_or_path = None,
         batch_size = 1,
         max_epochs = -1,
         max_steps = -1,
         saved_model_path=None,
-        max_response_len=256,
-        max_prompt_len=-1,
         use_peft=False,
         peft_path=None,
         train_args_path=None,
@@ -95,6 +91,9 @@ def do_train(
     ):
     
     # setup quantization config
+    accelerator = Accelerator()
+    is_main_process = accelerator.is_local_main_process
+    
     bnb_config = None
     if use_peft: 
         with open(peft_path, 'r') as f:
@@ -116,36 +115,43 @@ def do_train(
     if max_epochs > 0:
         available_trainer_args['num_train_epochs'] = max_epochs 
         available_trainer_args['warmup_ratio'] = 0.1
-        available_trainer_args['evaluation_strategy'] = 'epoch'
     else:
         available_trainer_args['max_steps'] = max_steps
         available_trainer_args['warmup_steps'] = int(0.1 * max_steps)
-        available_trainer_args['evaluation_strategy'] = 'steps'
-        available_trainer_args['eval_steps'] = int(0.2 * max_steps)
-    if max_prompt_len != -1:
-        train_args['max_prompt_length'] = max_prompt_len
+    # if max_prompt_len != -1:
+    #     train_args['max_prompt_length'] = max_prompt_len
+    num_devices = accelerator.num_processes
+    total_batch_size = batch_size * num_devices
+    total_steps = max_epochs * len(ds) // total_batch_size
+    eval_steps = total_steps//5
+    available_trainer_args['eval_steps'] = eval_steps
         
     training_args = TrainingArguments(**available_trainer_args)
-    if train_args['mode'] == 'sft': # smaller model lower lr
-        training_args.learning_rate = learning_rate if learning_rate != -1 else training_args.learning_rate
+    if learning_rate != -1: # smaller model lower lr
+        training_args.learning_rate = learning_rate 
     
     # Setup train/eval ds #
-    full_ds = list_to_hf_ds(ds,model_name_or_path,tokenizer,mode=train_args['mode']).shuffle(seed=42)
-    eval_size = int(train_args['eval_split'] * len(full_ds))
-    train_ds = full_ds.select(range(len(full_ds)-eval_size))
-    val_ds = full_ds.select(range(len(full_ds)-eval_size,len(full_ds)))
+    if isinstance(ds,list):
+        full_ds = list_to_hf_ds(ds,model_name_or_path,tokenizer,mode=train_args['mode']).shuffle(seed=42)
+    else:
+        full_ds = ds
+    if val_ds is None:
+        eval_size = int(train_args['eval_split'] * len(full_ds))
+        train_ds = full_ds.select(range(len(full_ds)-eval_size))
+        val_ds = full_ds.select(range(len(full_ds)-eval_size,len(full_ds)))
+    else:
+        train_ds = full_ds
+        if isinstance(ds,list):
+            val_ds = list_to_hf_ds(val_ds,model_name_or_path,tokenizer,mode=train_args['mode'])
     
     ## Print out first sample
-    accelerator = Accelerator()
-    is_main_process = accelerator.is_local_main_process
+    
     random_train_sample = train_ds[0]
     random_eval_sample = val_ds[0]
     if is_main_process:
         if train_args['mode'] == 'sft':
-            print ('train prompt: ',random_train_sample['prompt'])
-            print ('train answer: ',random_train_sample['completion'])
-            print ('eval prompt: ',random_eval_sample['prompt'])
-            print ('eval answer: ',random_eval_sample['completion'])
+            print ('train example: ',random_train_sample['text'])
+            print ('val example: ',random_eval_sample['text'])
         elif train_args['mode'] == 'dpo':
             print ('train prompt: ',random_train_sample['prompt'])
             print ('train chosen: ',random_train_sample['chosen'])
@@ -156,11 +162,13 @@ def do_train(
         
     ## Model args
     model_kwargs = dict(
-        torch_dtype='auto',
+        revision='main',
         device_map = None if not bnb_config else get_kbit_device_map(),
+        attn_implementation = 'flash_attention_2',
         quantization_config=bnb_config,
         trust_remote_code=True,
         use_cache = False if training_args.gradient_checkpointing else True,
+        torch_dtype = getattr(torch,train_args['dtype']) if train_args.get('dtype',None) else 'auto',
     )
     ref_model_kwargs = model_kwargs
 
@@ -173,13 +181,13 @@ def do_train(
             r=peft_config_dict['lora_r'],
             lora_alpha=peft_config_dict['lora_alpha'],
             lora_dropout=peft_config_dict['lora_dropout'],
-            target_modules=peft_config_dict['lora_layers'],
+            target_modules='all-linear',
             bias="none",
             task_type="CAUSAL_LM",
         )
         model_ref = None
         ref_model_kwargs = None
-        training_args.learning_rate = peft_config_dict['learning_rate'] # peft uses higher learning rate
+        training_args.learning_rate *= peft_config_dict['learning_rate_multiplier'] # peft uses higher learning rate, default * 10
         training_args.optim = peft_config_dict['optim']
         
     else:
@@ -199,21 +207,23 @@ def do_train(
             train_dataset=train_ds,
             eval_dataset = val_ds,
             tokenizer=tokenizer,
-            max_length=train_args['max_prompt_length'] + max_response_len,
+            max_length=train_args['max_length'],
             max_prompt_length=train_args['max_prompt_length'],
             peft_config=peft_config,
         )
     else:
-        format_template,response_template = format_instruction_response(model)
-        # response_template = tokenizer.encode('\n'+response_template,add_special_tokens=False)[2:] # add '\n to remove leading char.
-        def format_prompt_fn(example):
-            output_texts = []
-            for i in range(len(example['prompt'])):
-                text = format_template.format(instruction=example['prompt'][i],output=example['completion'][i])
-                output_texts.append(text)
-            return output_texts
+        ## Only use this if want to do loss on completion only
+        # format_template,response_template = format_instruction_response(model)
+        # if 'Llama' in model_name_or_path:
+        #     response_template = tokenizer.encode('\n'+response_template,add_special_tokens=False)[2:] # add '\n to remove leading char, not for mistral
+        # def format_prompt_fn(example):
+        #     output_texts = []
+        #     for i in range(len(example['prompt'])):
+        #         text = format_template.format(instruction=example['prompt'][i],output=example['completion'][i])
+        #         output_texts.append(text)
+        #     return output_texts
         
-        data_collator = DataCollatorForCompletionOnlyLM(response_template,tokenizer=tokenizer) # only trained on output
+        # data_collator = DataCollatorForCompletionOnlyLM(response_template,tokenizer=tokenizer) # only trained on output
         
         trainer = SFTTrainer(
         model=model,
@@ -221,13 +231,14 @@ def do_train(
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
-        max_seq_length=train_args['max_prompt_length'] + max_response_len,
+        max_seq_length=train_args['max_seq_length'],
         tokenizer=tokenizer,
-        packing=False,
+        packing=True,
         peft_config=peft_config,
-        # dataset_text_field = 'prompt'
-        data_collator = data_collator,
-        formatting_func=format_prompt_fn,
+        dataset_text_field = 'text',
+        dataset_num_proc=64,
+        # data_collator = data_collator,
+        # formatting_func=format_prompt_fn,
         )
     trainer.train()
     if saved_model_path is None:
@@ -241,6 +252,7 @@ def do_train(
         peft_model = AutoPeftModelForCausalLM.from_pretrained(
                     saved_model_path,
                     torch_dtype=torch.float16,
+                    device_map = None if not bnb_config else get_kbit_device_map(),
                     low_cpu_mem_usage=True)  
         merged_model = peft_model.merge_and_unload(progressbar=True)
         for os_file in os.listdir(saved_model_path): # remove the adapter files.

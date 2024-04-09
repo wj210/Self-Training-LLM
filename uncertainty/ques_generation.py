@@ -13,6 +13,7 @@ from torch.nn.utils.rnn import pad_sequence
 import random
 from utils import *
 from data_utils import *
+from topic_generator import get_topic_embedding_space,get_wordnet_nouns_and_embeddings
 from templates import format_question_generation
 from functools import partial
 from copy import deepcopy
@@ -168,8 +169,8 @@ def open_generate_qns(client,scorer,num_iterations,max_workers,gen_kwargs,tokeni
             with open(question_path,'wb') as f: # re-update the question_set with other approach scores.
                 pickle.dump(ans_dict,f)
     
-        # unknown_qns = return_question_type(ans_dict,scorer.scoring_method) ## TEMP
-        unknown_qns = ans_dict
+        unknown_qns = return_question_type(ans_dict,scorer.scoring_method) ## TEMP
+        # unknown_qns = ans_dict
         ## Get DPO dataset , get chosen answer based on google search, LLM generator or heuristics (confidence/entropy) ##
         get_ds_fn = partial(scorer.get_dpo_sample,few_shots=few_shots)
         generated_ds = []
@@ -319,7 +320,7 @@ def main():
             ## From self_learning_utils.py ##
             embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L12-v2", device="cpu")
             base_model = AutoModelForCausalLM.from_pretrained(config.model_name,torch_dtype=torch.bfloat16,trust_remote_code=True).cuda()
-            topic_space = get_nouns_and_embeddings(embedder)
+            topic_space = get_wordnet_nouns_and_embeddings(embedder)
             all_embeddings = topic_space['all_embeddings']
             all_topics = topic_space['all_nouns']
             topic_embedding_space = get_topic_embedding_space(all_embeddings=all_embeddings)
