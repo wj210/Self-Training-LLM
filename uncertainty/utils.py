@@ -268,17 +268,33 @@ def clean_non_instructed_answer(answer):
 
 
 
-def check_answer(ds,key = 'ref_answer'):
+def check_answer(ds,key = 'ref_answer',use_tgi=False):
     filtered_ds = []
     for d in ds:
         ans = d[key]
-        if 'there is no' in ans:
-            if 'mention' in ans or 'record' in ans or 'information' in ans or 'data' in ans or 'evidence' in ans:
+        if not isinstance(ans,str):
+            not_str = True
+            if use_tgi:
+                ans_text = ans.generated_text
+            else:
+                ans_text = ans['text']
+        else:
+            not_str = False
+            ans_text = ans
+        if 'there is no' in ans_text:
+            if 'mention' in ans_text or 'record' in ans_text or 'information' in ans_text or 'data' in ans_text:
                 continue
-        if 'i apologize' in ans or 'i cannot answer' in ans:
+        if 'i apologize' in ans_text or 'i cannot answer' in ans_text:
             continue
-        if 'Question:' in ans:
-            ans = ans.split('Question:')[0].strip()
+        if 'Question:' in ans_text:
+            ans_text = ans_text.split('Question:')[0].strip()
+        if not not_str:
+            d[key] = ans_text
+        else:
+            if use_tgi:
+                ans.generated_text = ans_text
+            else:
+                ans['text'] = ans_text
             d[key] = ans
         filtered_ds.append(d)
     return filtered_ds

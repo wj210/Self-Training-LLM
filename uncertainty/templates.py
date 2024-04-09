@@ -5,12 +5,12 @@ def format_question_generation(topic): # This is the prompt for question generat
     return prompt
 
 def format_question_w_document(topic,document):
-    prompt = f"{document}\n\nInstruction: propose only one question regarding \"{topic}\".\nQuestion: "
+    prompt = f"{document}\n\nInstruction: propose only one question regarding \"{topic}\". The question should be detailed and specific.\nProposed Question: "
     return prompt
 
 def format_answer(question,document=''):
     if document != '':
-        prompt = f"Information: {document}\n\nUse the information provided to answer the following question.\nQuestion: {question}\nAnswer: "
+        prompt = f"Evidence: {document}\n\nBased on evidence from Wikipedia, {question}\nAnswer: "
     else:
         prompt = f"Question: {question}\nAnswer: "
     return prompt

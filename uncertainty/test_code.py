@@ -26,7 +26,7 @@ def clean_question(question):
 
 def prompt_fn(topic,document=''):
     # return f"Document: {document}\n\nInstruction: propose one question regarding \"{topic}\". The question should be created based on details in the document.\nQ: "
-    return f"{document}\n\nInstruction: propose only one question regarding \"{topic}\".The question should be detailed and specific.\n\nProposed Question:" 
+    return f"{document}\n\nInstruction: propose only one question regarding \"{topic}\". The question should be detailed and specific.\n\nProposed Question:" 
 
 # def prompt_fn_answer(document,qn):
 #     if document != '':

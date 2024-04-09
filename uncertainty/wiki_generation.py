@@ -86,7 +86,6 @@ def open_generate_qns(client,
             inp_batch = []
         for qns_dict in qns_dicts:
             qns = qns_dict['instruction']
-            topic = qns_dict['topic']
             document = qns_dict['document']
             if type_ in ['ref_answer','question_filtering']:
                 ans_fs = ans_few_shot_ref
@@ -101,22 +100,21 @@ def open_generate_qns(client,
             if use_tgi:
                 try:
                     ans = tgi_generate(ans_prompt,prompt_type=type_)
-                    return {'instruction':qns,'topic':topic,type_:ans,'document':document}
+                    return {**qns_dict,type_:ans}
                 except Exception as e:
                     print (e)
                     return None
             else:
-                inp_batch.append({'instruction':ans_prompt,'topic':topic,type_:ans_prompt,'document':document})
+                inp_batch.append({**qns_dict,type_:ans_prompt})
         if not use_tgi:
-            out_batch = [{'topic':x['topic'],'instruction':x['instruction'],'document':x['document']} for x in inp_batch]
             ans_batch = [{type_:x[type_]} for x in inp_batch]
             dict_keys['input'] = type_
             dict_keys['output'] = type_
             generate_args = gen_kwargs[type_]
             gen_batch = HF_generate(ans_batch,client,tokenizer,generate_args,max_workers=len(ans_batch),dict_keys=dict_keys,return_probs=True)
-            for o,g in zip(out_batch,gen_batch):
+            for o,g in zip(inp_batch,gen_batch):
                 o[type_] = g[type_]
-            return out_batch 
+            return inp_batch 
         
     def get_scored_ds(ans_dict):
         all_qn_confidences = []
@@ -174,7 +172,7 @@ def open_generate_qns(client,
         #######################
         ## GENERATE QUESTION ##
         #######################
-        qns_prompts_dict = [generate_qns_prompt(topic,document_dict) for topic in topics[:2]]
+        qns_prompts_dict = [generate_qns_prompt(topic,document_dict) for topic in topics]
         qns_prompts = [q for q in qns_prompts_dict if q is not None]
         qns_prompts = sum(qns_prompts,[]) # flatten
         if use_tgi:
@@ -194,21 +192,19 @@ def open_generate_qns(client,
         #######################
         ref_ans_fn = partial(generate_ans,type_='ref_answer')
         ref_ans_content = filter_none(ans_call_fn(ref_ans_fn,qns_dict,max_workers,msg = 'Generating ref answers'))
-        ref_ans_content = check_answer(ref_ans_content) # filter the answer for any "i cannot answer"
-        print (ref_ans_content[0].keys())
+        ref_ans_content = check_answer(ref_ans_content,key='ref_answer',use_tgi=use_tgi) # filter the answer for any "i cannot answer"
         if question_filtering:
             qn_filter_fn = partial(generate_ans,type_='question_filtering')
             qn_filter_ans = filter_none(ans_call_fn(qn_filter_fn,ref_ans_content,max_workers,msg = 'Generating hallucination score to filter questions'))
-            print (qn_filter_ans[0].keys())
             scored_qns = get_scored_ds(qn_filter_ans) # get question quality score
-            print (scored_qns[0].keys())
             filtered_qns = return_question_type(scored_qns,scorer.scoring_method,'known') # filter out poor questions
+            print (f'Filtered down to {len(filtered_qns)} from {len(scored_qns)} questions.')
+            for q in filtered_qns:
+                q.pop(score_key) # Impt, to remove the score from the question else later will skip the scored_ds fn.
         else:
             filtered_qns = ref_ans_content
         sample_ans_fn = partial(generate_ans,type_='sample_answer')
         ans_dict = filter_none(ans_call_fn(sample_ans_fn,filtered_qns,max_workers,msg = 'Generating sample answers'))
-        print (ans_dict[0].keys())
-        exit()
         with open(question_path,'wb') as f:
             pickle.dump(ans_dict,f)
     else:
@@ -229,6 +225,7 @@ def open_generate_qns(client,
     ## GENERATE DPO SAMPLE ##
     #########################
     unknown_qns = return_question_type(all_qn_confidences,scorer.scoring_method,'unknown')
+    print (f'Remaining {len(unknown_qns)} unknown questions out of {len(all_qn_confidences)} questions.')
     get_ds_fn = partial(scorer.get_dpo_sample,fs_messages=ans_few_shot_sample)
     generated_ds = []
     for unknwn_qn in tqdm(unknown_qns,desc='Generating dpo samples',total = len(unknown_qns)):
