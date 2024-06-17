@@ -1,18 +1,14 @@
 data
-model_checkpoints
-model_checkpoints_full
 test_results
 cuda_dev
 mem.py
 scripts
-openai_api_key.txt
-uncertainty/test_code.py
-uncertainty/create_catastrophic_ds.py
-uncertainty/wiki_generation_old.py
-roberta_stopwords.txt
-.cache
-lm-evaluation-harness
-results
-log_results
-
+my_openai_api_key.txt
+uncertainty/few_shot.py
+uncertainty/ques_generation.py
+uncertainty/train_debug.py
+uncertainty/test.py
+llm_judge_cache
+responses
+model_checkpoints
 

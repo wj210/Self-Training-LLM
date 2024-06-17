@@ -1,4 +1,0 @@
-model_name: mistralai/Mistral-7B-v0.1
-model_path: model_checkpoints/SFT/mistral_{topic_generator}
-result_path: test_results/SFT/mistral_{topic_generator}.txt
-learning_rate: 2.0e-5

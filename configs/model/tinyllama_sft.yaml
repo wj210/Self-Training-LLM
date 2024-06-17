@@ -1,6 +1,0 @@
-model_name: model_checkpoints_full/SFT/tinyllama_ultrachat
-train_dataset_path: data/{topic_generator}/train/tinyllama_UC_{scoring_name}_{answer_generator}.jsonl
-question_path: data/{topic_generator}/questions/tinyllama_UC.pkl
-model_path: model_checkpoints/{topic_generator}/tinyllama_UC_{scoring_name}_{answer_generator}_top{filter_size}
-result_path: test_results/{topic_generator}/tinyllama_UC_{scoring_name}_{answer_generator}_top{filter_size}.txt
-learning_rate: 1.0e-6

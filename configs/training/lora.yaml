@@ -1,7 +1,7 @@
-lora_r: 32
-lora_alpha: 32
+lora_r: 256
+lora_alpha: 256
 lora_dropout: 0.05
-quantized: True
+quantized: true
 lora_layers: ['down_proj', 'up_proj', 'gate_proj', 'q_proj', 'k_proj', 'v_proj', 'o_proj']
 learning_rate_multiplier: 10.0
 optim: paged_adamw_32bit

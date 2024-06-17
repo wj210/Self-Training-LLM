@@ -1,0 +1,11 @@
+base_model_name: meta-llama/Llama-2-13b-hf
+sft_model_path: model_checkpoints/SFT/llama2_13b_{answer_generator}
+dpo_model_path: model_checkpoints/DPO/llama2_13b_{answer_generator}
+result_path: test_results/{mode}/llama2_13b_{answer_generator}.txt
+sft_answer_path: data/wiki/answer/llama2_13b_sft_{answer_generator}.pkl
+dpo_answer_path: data/wiki/answer/llama2_13b_dpo_{answer_generator}.pkl
+question_path: data/wiki/questions.jsonl
+context_answer_path: data/wiki/context_answer.jsonl
+sft_learning_rate: 1.0e-5
+dpo_learning_rate: 5.0e-7
+temperature: 1.0

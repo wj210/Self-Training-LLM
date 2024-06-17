@@ -32,7 +32,6 @@ def open_generate_qns(client,scorer,num_iterations,max_workers,gen_kwargs,tokeni
     known_question_path/unknown to save QH and Q_notH
     exclude_questions = list of QA_sample from data_utils.py
     """
-    is_instruct_tuned = if_instruction_tuned(model_name)
     r_scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=False)
     score_key = SCORE_KEY[scorer.scoring_method]
     

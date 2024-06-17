@@ -1,7 +1,7 @@
 mode: dpo
 eval_split: 0.05
 bf16: true
-beta: 0.5
+beta: 0.3
 do_eval: true
 do_train: true
 overwrite_output_dir: true
@@ -11,8 +11,8 @@ learning_rate: 5.0e-7
 log_level: info
 logging_steps: 10
 lr_scheduler_type: cosine
-max_prompt_length: 512
-max_length: 1024
+max_prompt_length: 128
+max_length: 512
 optim: adamw_torch
 save_strategy: "no"
 save_total_limit: null
@@ -21,3 +21,4 @@ report_to: tensorboard
 push_to_hub: false
 evaluation_strategy: steps
 eval_steps: 500
+torch_dtype: bfloat16

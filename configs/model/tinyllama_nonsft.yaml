@@ -1,4 +1,0 @@
-model_name: TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T
-model_path: model_checkpoints/SFT/tinyllama_{topic_generator}
-result_path: test_results/SFT/tinyllama_{topic_generator}.txt
-learning_rate: 2.0e-5
